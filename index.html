@@ -1,0 +1,1489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tally Connected ERP - Barcode Sales</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom Tally-like dark theme scrollbar for better aesthetics */
+        body { scrollbar-color: #0c4a6e #0f172a; scrollbar-width: thin; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #0f172a; } /* Slate-900 */
+        ::-webkit-scrollbar-thumb { background: #0c4a6e; border-radius: 4px; } /* Sky-900 */
+        ::-webkit-scrollbar-thumb:hover { background: #075985; } /* Sky-800 */
+        
+        /* Ensures the whole screen is covered */
+        #app { min-height: 100vh; }
+        
+        /* Tally Button Styling */
+        .tally-btn {
+            padding: 8px 16px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            border-radius: 0.25rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+            transition: all 0.2s;
+            background-color: #075985; /* sky-800 */
+            color: white;
+        }
+        .tally-btn:hover:not(:disabled) { background-color: #0369a1; } /* sky-700 */
+        .tally-btn:active:not(:disabled) { transform: translateY(1px); box-shadow: 0 2px 4px -2px rgba(0, 0, 0, 0.1); }
+        .tally-btn:disabled { opacity: 0.5; cursor: not-allowed; background-color: #4b5563; } /* gray-600 */
+    </style>
+</head>
+<body class="bg-gray-900 font-sans antialiased">
+    <div id="app">
+        <!-- Content will be rendered here by JavaScript -->
+        <div class="text-center p-8 text-sky-400">Loading Tally System...</div>
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-auth.js";
+        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-firestore.js";
+
+        // ====================================================================================
+        // !!! CORE CONFIGURATION (DO NOT CHANGE THESE VARIABLES) !!!
+        // The Canvas environment provides these automatically
+        // ====================================================================================
+        const AppId = typeof __app_id !== 'undefined' ? __app_id : 'default-tally-erp-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // 3. User Map for simple Tally-like client-side role assignment
+        const USER_ROLES = {
+            'admin1': { role: 'admin', password: 'adminpassword' },
+            'executive_sales': { role: 'executive' }, 
+            'boss': { role: 'admin', password: 'adminpassword' },
+        };
+        
+        // Define Firestore Paths
+        const Paths = {
+            INVENTORY: `artifacts/${AppId}/public/data/inventory_master`,
+            PARTIES: `artifacts/${AppId}/public/data/party_master`,
+            SALES_PENDING: `artifacts/${AppId}/public/data/sales_voucher_pending`,
+            SALES_APPROVED: `artifacts/${AppId}/public/data/sales_voucher_approved`,
+        };
+        
+        // Global state storage
+        let state = {
+            db: null,
+            auth: null,
+            loggedInUser: null,
+            userRole: null,
+            firebaseUserId: null,
+            isAuthReady: false,
+            currentPage: 'sales',
+            // Data collections
+            inventory: [],
+            parties: [],
+            pendingSales: [],
+            approvedSales: [],
+            // Modal/Confirmation state
+            isModalOpen: false,
+            modalContent: null,
+            confirmation: null,
+            message: ''
+        };
+
+        // ====================================================================================
+        // --- 1. FIREBASE INITIALIZATION & DATA SUBSCRIPTION ---
+        // ====================================================================================
+
+        async function initFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                state.db = getFirestore(app);
+                state.auth = getAuth(app);
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                state.message = "Database connection failed. Cannot run multi-user app.";
+                render();
+                return;
+            }
+
+            // Authentication Listener
+            onAuthStateChanged(state.auth, (user) => {
+                if (user) {
+                    state.firebaseUserId = user.uid;
+                } else {
+                    state.firebaseUserId = null;
+                }
+                state.isAuthReady = true;
+                if (!state.loggedInUser) {
+                    render(); // Only re-render for login if user is not logged in yet
+                }
+            });
+
+            // Sign in (Canvas requirement)
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(state.auth, initialAuthToken);
+                } else if (!state.auth.currentUser) {
+                    await signInAnonymously(state.auth);
+                }
+            } catch (error) {
+                console.warn("Initial auth failed, attempting anonymous sign-in.", error);
+                await signInAnonymously(state.auth);
+            }
+
+            // Start Data Listeners
+            startDataListeners();
+        }
+        
+        function startDataListeners() {
+            if (!state.db) return;
+
+            // Inventory Master
+            onSnapshot(collection(state.db, Paths.INVENTORY), (snapshot) => {
+                state.inventory = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                render();
+            }, (error) => console.error("Inventory Snapshot Error:", error));
+
+            // Parties Master
+            onSnapshot(collection(state.db, Paths.PARTIES), (snapshot) => {
+                state.parties = snapshot.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.name.localeCompare(b.name));
+                render();
+            }, (error) => console.error("Parties Snapshot Error:", error));
+
+            // Pending Sales Vouchers
+            onSnapshot(collection(state.db, Paths.SALES_PENDING), (snapshot) => {
+                state.pendingSales = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                render();
+            }, (error) => console.error("Pending Sales Snapshot Error:", error));
+            
+            // Approved Sales Vouchers
+            onSnapshot(collection(state.db, Paths.SALES_APPROVED), (snapshot) => {
+                state.approvedSales = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                render();
+            }, (error) => console.error("Approved Sales Snapshot Error:", error));
+        }
+
+        // ====================================================================================
+        // --- 2. CORE UI COMPONENTS (HTML TEMPLATES) ---
+        // ====================================================================================
+
+        function TallyInput({ label, id, type = 'text', value, placeholder, disabled = false, autoFocus = false, onChange, onKeyDown, min, max, className = '' }) {
+            const inputProps = `id="${id}" type="${type}" value="${value !== null ? value : ''}" 
+                                placeholder="${placeholder || ''}" 
+                                class="p-2 text-sm bg-gray-800 border border-gray-700 rounded text-white focus:ring-sky-500 focus:border-sky-500 w-full ${disabled ? 'opacity-50 cursor-not-allowed' : ''} ${className}" 
+                                ${disabled ? 'disabled' : ''} ${autoFocus ? 'autofocus' : ''}
+                                ${min !== undefined ? `min="${min}"` : ''} ${max !== undefined ? `max="${max}"` : ''}`;
+            
+            const eventListeners = [];
+            if (onChange) eventListeners.push(`onchange="eventHandlers['${onChange.name}'](event)"`);
+            if (onKeyDown) eventListeners.push(`onkeydown="eventHandlers['${onKeyDown.name}'](event)"`);
+
+            return `
+                <div class="flex flex-col mb-4">
+                    <label for="${id}" class="text-xs font-semibold uppercase tracking-wider text-sky-300 mb-1">
+                        ${label}
+                    </label>
+                    <input ${inputProps} ${eventListeners.join(' ')}>
+                </div>`;
+        }
+        
+        function TallySelect({ label, id, value, options, disabled = false, onChange }) {
+            const inputProps = `id="${id}" 
+                                class="p-2 text-sm bg-gray-800 border border-gray-700 rounded text-white focus:ring-sky-500 focus:border-sky-500 w-full ${disabled ? 'opacity-50 cursor-not-allowed' : ''}" 
+                                ${disabled ? 'disabled' : ''}`;
+            
+            const eventListeners = [];
+            if (onChange) eventListeners.push(`onchange="eventHandlers['${onChange.name}'](event)"`);
+
+            const optionHTML = options.map(option => 
+                `<option value="${option.value}" ${value == option.value ? 'selected' : ''}>${option.label}</option>`
+            ).join('');
+
+            return `
+                <div class="flex flex-col mb-4">
+                    <label for="${id}" class="text-xs font-semibold uppercase tracking-wider text-sky-300 mb-1">
+                        ${label}
+                    </label>
+                    <select ${inputProps} ${eventListeners.join(' ')}>
+                        ${optionHTML}
+                    </select>
+                </div>`;
+        }
+
+        function TallyButton({ onClick, children, className = '', type = 'button', disabled = false }) {
+            const eventListeners = [];
+            if (onClick) eventListeners.push(`onclick="eventHandlers['${onClick.name}'](event)"`);
+
+            return `
+                <button type="${type}" ${eventListeners.join(' ')} 
+                    class="tally-btn ${className}" ${disabled ? 'disabled' : ''}>
+                    ${children}
+                </button>`;
+        }
+        
+        function TallyMessage() {
+             if (!state.message) return '';
+             const isError = state.message.startsWith('ERROR');
+             const bgColor = isError ? 'bg-red-900' : 'bg-green-900';
+             const textColor = isError ? 'text-red-200' : 'text-green-200';
+             
+             // Clear message after 5 seconds
+             if (state.message) {
+                 setTimeout(() => {
+                     if (state.message) { // Check if it wasn't overwritten
+                        state.message = '';
+                        render();
+                     }
+                 }, 5000);
+             }
+
+             return `
+                 <div class="p-3 mb-4 text-sm font-medium rounded ${textColor} ${bgColor}">
+                     ${state.message}
+                 </div>
+             `;
+         }
+
+        // ====================================================================================
+        // --- 3. PAGE LOGIC AND RENDERING (Single-Page App Navigation) ---
+        // ====================================================================================
+
+        // Global object to map function names to actual functions (for use in dynamic HTML attributes)
+        const eventHandlers = {};
+
+        function setPage(pageId) {
+            state.currentPage = pageId;
+            state.message = ''; // Clear message on page change
+            render();
+        }
+        eventHandlers.setPage = setPage;
+        
+        // --- RENDER LOGIN SCREEN ---
+        function renderLoginScreen() {
+            const handleUsernameChange = (e) => {
+                const username = e.target.value;
+                document.getElementById('password-section').innerHTML = ''; // Clear previous password section
+
+                const lowerCaseUsername = username.trim().toLowerCase();
+                const user = USER_ROLES[lowerCaseUsername];
+
+                if (user?.role === 'admin') {
+                    // Inject password input if admin
+                    document.getElementById('password-section').innerHTML = TallyInput({
+                        label: "Password (Admin Only)",
+                        id: "password",
+                        type: "password",
+                        value: '',
+                        onChange: handlePasswordChange,
+                        placeholder: "Enter Admin Password"
+                    });
+                }
+                document.getElementById('username-input').value = username; // Manually update for controlled field
+            };
+
+            const handlePasswordChange = (e) => {
+                document.getElementById('password-input').value = e.target.value;
+            };
+
+            const handleLogin = (e) => {
+                e.preventDefault();
+                const usernameInput = document.getElementById('username-input');
+                const passwordInput = document.getElementById('password-input');
+                
+                const username = usernameInput ? usernameInput.value.trim() : '';
+                const password = passwordInput ? passwordInput.value : '';
+
+                const lowerCaseUsername = username.toLowerCase();
+                const user = USER_ROLES[lowerCaseUsername];
+                
+                state.message = '';
+
+                if (!user) {
+                    state.message = `ERROR: User "${username}" not recognized.`;
+                    render();
+                    return;
+                }
+
+                if (user.role === 'admin') {
+                    if (password === user.password) {
+                        state.loggedInUser = username;
+                        state.userRole = user.role;
+                    } else {
+                        state.message = 'ERROR: Invalid password for Admin.';
+                        render();
+                        return;
+                    }
+                } else { // Executive Login (no password needed)
+                    state.loggedInUser = username; 
+                    state.userRole = user.role;
+                }
+                
+                state.currentPage = state.userRole === 'admin' ? 'inventory' : 'sales';
+                render();
+            };
+            eventHandlers.handleLogin = handleLogin;
+            eventHandlers.handleUsernameChange = handleUsernameChange;
+            eventHandlers.handlePasswordChange = handlePasswordChange;
+
+            return `
+                <div class="min-h-screen flex items-center justify-center bg-gray-900 p-4">
+                    <div class="bg-gray-800 p-8 rounded-xl shadow-2xl w-full max-w-sm border border-sky-700">
+                        <h2 class="text-3xl font-bold text-center text-sky-400 mb-6">Tally Connected Login</h2>
+                        ${TallyMessage()}
+                        
+                        <form onsubmit="eventHandlers.handleLogin(event)">
+                            <div class="flex flex-col mb-4">
+                                <label for="username-input" class="text-xs font-semibold uppercase tracking-wider text-sky-300 mb-1">Username</label>
+                                <input id="username-input" type="text" onchange="eventHandlers.handleUsernameChange(event)" placeholder="e.g., admin1 or executive_sales" autofocus
+                                    class="p-2 text-sm bg-gray-800 border border-gray-700 rounded text-white focus:ring-sky-500 focus:border-sky-500" />
+                            </div>
+
+                            <div id="password-section">
+                                <!-- Password input injected here for Admin role -->
+                            </div>
+                            
+                            ${TallyButton({ type: 'submit', children: 'Log In', className: 'w-full mt-4' })}
+                        </form>
+                        <div class="mt-4 p-3 bg-gray-900 rounded text-xs text-gray-400">
+                            <p class="text-white font-semibold mb-1">Demo Users:</p>
+                            <p>Admin: <b>admin1</b> (Pass: adminpassword)</p>
+                            <p>Executive: <b>executive_sales</b> (No Password)</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // --- RENDER MAIN LAYOUT ---
+        function renderMainLayout(contentHTML) {
+            const handleLogout = () => {
+                state.loggedInUser = null;
+                state.userRole = null;
+                state.currentPage = 'sales';
+                render();
+            };
+            eventHandlers.handleLogout = handleLogout;
+            
+            const renderNavigationMenu = () => {
+                const userRole = state.userRole;
+                const menuItems = [
+                    { id: 'sales', label: 'Sales Voucher (F8)', role: ['admin', 'executive'] },
+                    { id: 'parties', label: 'Party Master (Ledgers)', role: ['admin', 'executive'] }, 
+                    { id: 'inventory', label: 'Stock Master', role: ['admin'] },
+                    { id: 'admin-panel', label: 'Admin Panel (F9/Approval)', role: ['admin'] },
+                    { id: 'reports', label: 'Display: Daybook', role: ['admin'] },
+                ].filter(item => item.role.includes(userRole));
+                
+                const pendingCount = state.pendingSales.length;
+
+                return `
+                    <div class="bg-gray-900 shadow-2xl h-full p-4 border-r border-sky-900">
+                        <h3 class="text-xl font-bold text-sky-400 mb-4">Tally Menu</h3>
+                        <nav class="space-y-2">
+                            ${menuItems.map(item => `
+                                <button onclick="eventHandlers.setPage('${item.id}')"
+                                    class="w-full text-left p-3 rounded-lg font-medium transition-colors duration-150 flex justify-between items-center
+                                    ${state.currentPage === item.id ? 'bg-sky-700 text-white shadow-lg border border-sky-500' : 'text-sky-200 hover:bg-gray-800'}">
+                                    <span>${item.label}</span>
+                                    ${item.id === 'admin-panel' && pendingCount > 0 ? `<span class="px-2 py-0.5 text-xs font-bold bg-red-600 rounded-full text-white">${pendingCount} Pending</span>` : ''}
+                                </button>
+                            `).join('')}
+                        </nav>
+                    </div>
+                `;
+            };
+
+            const headerHTML = `
+                <header class="md:hidden bg-gray-900 p-4 border-b border-sky-900 shadow-md">
+                    <p class="text-lg font-bold text-sky-400">TALLY CONNECTED ERP</p>
+                    <div class="flex justify-between items-center mt-1">
+                        <p class="text-xs text-yellow-400">User: ${state.loggedInUser} (${state.userRole})</p>
+                        <button onclick="eventHandlers.handleLogout()" class="text-xs text-red-400 hover:text-red-200">Logout</button>
+                    </div>
+                    <!-- Mobile Navigation Dropdown -->
+                    ${TallySelect({
+                        id: 'mobile-nav',
+                        label: 'Go to Page (Mobile)',
+                        value: state.currentPage,
+                        onChange: (e) => setPage(e.target.value),
+                        options: [
+                            { value: 'sales', label: 'Sales Voucher (F8)' },
+                            { value: 'parties', label: 'Party Master (Ledgers)' },
+                            ...(state.userRole === 'admin' ? [
+                                { value: 'inventory', label: 'Stock Master' },
+                                { value: 'admin-panel', label: 'Admin Panel (F9/Approval)' },
+                                { value: 'reports', label: 'Display: Daybook' },
+                            ] : [])
+                        ]
+                    })}
+                </header>
+            `;
+
+            return `
+                <div class="min-h-screen bg-gray-900 text-white flex flex-col md:flex-row">
+                    ${headerHTML}
+                    <!-- Sidebar (Desktop) -->
+                    <div class="hidden md:block w-64 flex-shrink-0">
+                        <div class="sticky top-0 h-screen">
+                            ${renderNavigationMenu()}
+                            <div class="absolute bottom-0 p-4 w-full bg-gray-900 border-t border-sky-900">
+                                <p class="text-sm font-bold text-sky-300">USER: ${state.loggedInUser}</p>
+                                <p class="text-xs text-yellow-400">Role: ${state.userRole.toUpperCase()}</p>
+                                <p class="text-xs text-gray-500">Cloud ID: ${state.firebaseUserId ? `${state.firebaseUserId.substring(0, 8)}...` : 'N/A'}</p>
+                                <button onclick="eventHandlers.handleLogout()" class="text-xs text-red-400 hover:text-red-200 mt-1">Logout</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Main Content Area -->
+                    <main class="flex-1 overflow-y-auto p-0 md:p-2">
+                        <div class="bg-gray-900 shadow-xl rounded-lg min-h-full">
+                            <div class="hidden md:flex justify-between items-center p-4 bg-gray-800 border-b border-sky-900 rounded-t-lg">
+                                <h1 class="text-xl font-light text-sky-200">Tally Connected Inventory & Sales</h1>
+                                <p class="text-sm text-yellow-400">Current View: **${state.currentPage.replace('-', ' ').toUpperCase()}**</p>
+                            </div>
+                            ${contentHTML}
+                            ${renderConfirmationModal()}
+                        </div>
+                    </main>
+                </div>
+            `;
+        }
+
+        // --- RENDER MODAL / CONFIRMATION ---
+        function renderTallyModal(title, contentHTML, onClose, showFooter = true) {
+            const handleClose = () => {
+                state.isModalOpen = false;
+                state.modalContent = null;
+                if (onClose) onClose();
+                render();
+            };
+            eventHandlers.closeModal = handleClose;
+
+            return `
+                <div class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+                    <div class="bg-gray-900 border border-sky-700 rounded-lg shadow-2xl w-full max-w-lg">
+                        <div class="flex justify-between items-center border-b border-sky-700 p-4">
+                            <h3 class="text-xl font-bold text-sky-200">${title}</h3>
+                            <button onclick="eventHandlers.closeModal()" class="text-gray-400 hover:text-white text-2xl leading-none">&times;</button>
+                        </div>
+                        <div class="p-4 text-white max-h-[80vh] overflow-y-auto">
+                            ${contentHTML}
+                        </div>
+                        ${showFooter ? `<div class="p-4 border-t border-sky-700 text-right">
+                            <button onclick="eventHandlers.closeModal()" class="tally-btn bg-gray-700 hover:bg-gray-600">Close</button>
+                        </div>` : ''}
+                    </div>
+                </div>
+            `;
+        }
+        
+        function renderConfirmationModal() {
+            if (!state.confirmation) return '';
+            
+            const onConfirm = () => {
+                state.confirmation.onYes();
+                state.confirmation = null;
+                render();
+            };
+            const onCancel = () => {
+                state.confirmation.onNo();
+                state.confirmation = null;
+                render();
+            };
+            eventHandlers.confirmYes = onConfirm;
+            eventHandlers.confirmNo = onCancel;
+            
+            return `
+                <div class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+                    <div class="bg-gray-900 border border-red-700 rounded-lg shadow-2xl w-full max-w-sm">
+                        <div class="flex justify-between items-center border-b border-red-700 p-4">
+                            <h3 class="text-xl font-bold text-red-300">CONFIRMATION REQUIRED</h3>
+                        </div>
+                        <div class="p-4 text-white">
+                            <p class="text-base mb-6">${state.confirmation.message}</p>
+                            <div class="flex justify-end space-x-4">
+                                <button onclick="eventHandlers.confirmNo()" class="tally-btn bg-gray-600 hover:bg-gray-500">Cancel</button>
+                                <button onclick="eventHandlers.confirmYes()" class="tally-btn bg-red-600 hover:bg-red-500">Confirm Action</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function showConfirm(message, onYes, onNo = () => {}) {
+            state.confirmation = { message, onYes, onNo };
+            render();
+        }
+
+        // ====================================================================================
+        // --- 4. PAGE IMPLEMENTATIONS (Logic for each screen) ---
+        // ====================================================================================
+
+        // --- Parties Master (Ledgers) ---
+        function renderPartiesMaster() {
+            const canEdit = state.userRole === 'admin';
+            let currentParty = null;
+
+            const resetForm = () => {
+                currentParty = null;
+                document.getElementById('partyName').value = '';
+                document.getElementById('contact').value = '';
+                document.getElementById('message').innerHTML = '';
+            };
+
+            const handleEdit = (partyId) => {
+                if (!canEdit) {
+                    state.message = 'ERROR: Permission Denied. Only Admin can alter ledgers.';
+                    render();
+                    return;
+                }
+                currentParty = state.parties.find(p => p.id === partyId);
+                if (!currentParty) return;
+
+                const formHTML = `
+                    <form id="party-form" onsubmit="eventHandlers.handleSubmitParty(event, '${currentParty.id}')">
+                        <div id="message"></div>
+                        ${TallyInput({ label: "Party Name", id: "partyName", value: currentParty.name, placeholder: "e.g., Cash or John Smith", autoFocus: true })}
+                        ${TallyInput({ label: "Contact Details", id: "contact", value: currentParty.contact || '', placeholder: "Optional: Phone/Email" })}
+                        ${TallyButton({ type: 'submit', children: 'Accept Alteration', className: 'w-full mt-4' })}
+                    </form>
+                `;
+                
+                state.modalContent = renderTallyModal("Alter Ledger", formHTML, () => { currentParty = null; }, false);
+                state.isModalOpen = true;
+                render();
+            };
+            eventHandlers.handleEditParty = handleEdit;
+            
+            const handleNew = () => {
+                if (!canEdit) {
+                    state.message = 'ERROR: Permission Denied. Only Admin can create new ledgers.';
+                    render();
+                    return;
+                }
+                currentParty = null;
+
+                const formHTML = `
+                    <form id="party-form" onsubmit="eventHandlers.handleSubmitParty(event, null)">
+                        <div id="message"></div>
+                        ${TallyInput({ label: "Party Name", id: "partyName", value: '', placeholder: "e.g., Cash or John Smith", autoFocus: true })}
+                        ${TallyInput({ label: "Contact Details", id: "contact", value: '', placeholder: "Optional: Phone/Email" })}
+                        ${TallyButton({ type: 'submit', children: 'Accept New Ledger', className: 'w-full mt-4' })}
+                    </form>
+                `;
+                state.modalContent = renderTallyModal("Create New Ledger", formHTML, () => { currentParty = null; }, false);
+                state.isModalOpen = true;
+                render();
+            };
+            eventHandlers.handleNewParty = handleNew;
+
+            const handleSubmit = async (e, partyId) => {
+                e.preventDefault();
+                const partyName = document.getElementById('partyName').value.trim();
+                const contact = document.getElementById('contact').value.trim();
+                const formMessage = document.getElementById('message');
+                formMessage.innerHTML = '';
+
+                const data = {
+                    name: partyName,
+                    contact: contact,
+                    updatedBy: state.loggedInUser,
+                    updatedAt: new Date().toISOString()
+                };
+
+                if (!data.name) {
+                    formMessage.innerHTML = '<p class="text-sm text-red-400 mb-3">Party Name is required.</p>';
+                    return;
+                }
+                
+                if (state.parties.some(p => p.name.toLowerCase() === data.name.toLowerCase() && p.id !== partyId)) {
+                    formMessage.innerHTML = '<p class="text-sm text-red-400 mb-3">A party with this name already exists.</p>';
+                    return;
+                }
+
+                try {
+                    if (partyId) {
+                        await updateDoc(doc(state.db, Paths.PARTIES, partyId), data);
+                        state.message = `SUCCESS: Ledger ${data.name} updated.`;
+                    } else {
+                        await addDoc(collection(state.db, Paths.PARTIES), {
+                            ...data,
+                            createdBy: state.loggedInUser,
+                            createdAt: new Date().toISOString()
+                        });
+                        state.message = `SUCCESS: New Ledger ${data.name} created.`;
+                    }
+                    setTimeout(() => {
+                        state.isModalOpen = false;
+                        render();
+                    }, 500);
+
+                } catch (error) {
+                    console.error("Error saving party:", error);
+                    formMessage.innerHTML = '<p class="text-sm text-red-400 mb-3">ERROR: Failed to save ledger.</p>';
+                }
+            };
+            eventHandlers.handleSubmitParty = handleSubmit;
+
+            const handleDelete = (partyId, partyName) => {
+                if (!canEdit) {
+                    state.message = 'ERROR: Permission Denied. Only Admin can delete ledgers.';
+                    render();
+                    return;
+                }
+                showConfirm(`Are you sure you want to delete the ledger entry "${partyName}"? This cannot be undone.`, 
+                    async () => {
+                        try {
+                            await deleteDoc(doc(state.db, Paths.PARTIES, partyId));
+                            state.message = `SUCCESS: Party ledger "${partyName}" deleted.`;
+                            render();
+                        } catch (error) {
+                            console.error("Error deleting party:", error);
+                            state.message = 'ERROR: Failed to delete party.';
+                            render();
+                        }
+                    }
+                );
+            };
+            eventHandlers.handleDeleteParty = handleDelete;
+
+
+            const tableRows = state.parties.length === 0 ? (
+                `<tr><td colspan="4" class="py-4 text-center text-gray-500">No ledgers found.</td></tr>`
+            ) : state.parties.map((party) => `
+                <tr class="bg-gray-800 border-b border-gray-700 hover:bg-gray-700 transition-colors">
+                    <td class="px-6 py-3 font-medium text-white">${party.name}</td>
+                    <td class="px-6 py-3 text-yellow-400">${party.contact || 'N/A'}</td>
+                    <td class="px-6 py-3 text-gray-400">${party.createdBy || 'System'}</td>
+                    <td class="px-6 py-3 space-x-2">
+                        ${canEdit ? `
+                            <button onclick="eventHandlers.handleEditParty('${party.id}')" class="text-sky-400 hover:text-sky-200 text-sm">Alter</button>
+                            <button onclick="eventHandlers.handleDeleteParty('${party.id}', '${party.name}')" class="text-red-400 hover:text-red-300 text-sm">Delete</button>
+                        ` : `<span class="text-green-400">View Only</span>`}
+                    </td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="p-4 bg-gray-900 min-h-full">
+                    <h2 class="text-2xl font-bold text-sky-400 mb-6 border-b border-gray-700 pb-2">Party Master (Ledgers)</h2>
+                    ${TallyMessage()}
+                    
+                    ${TallyButton({ onClick: handleNew, children: '+ Create New Ledger (F3)', className: 'mb-6', disabled: !canEdit })}
+
+                    <div class="overflow-x-auto rounded-lg shadow-xl border border-gray-700">
+                        <table class="w-full text-left text-sm text-gray-200">
+                            <thead class="text-xs uppercase bg-sky-900/50 text-sky-200 border-b border-sky-700">
+                                <tr>
+                                    <th scope="col" class="px-6 py-3">Party Name</th>
+                                    <th scope="col" class="px-6 py-3">Contact/Phone</th>
+                                    <th scope="col" class="px-6 py-3">Created By</th>
+                                    <th scope="col" class="px-6 py-3">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${tableRows}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                ${state.isModalOpen && state.modalContent ? state.modalContent : ''}
+            `;
+        }
+        
+        // --- Inventory Master (Stock) ---
+        function renderInventoryMaster() {
+            let currentItem = null;
+
+            const handleNew = () => {
+                currentItem = null;
+                renderInventoryForm(null);
+            };
+            eventHandlers.handleNewInventory = handleNew;
+
+            const handleEdit = (itemId) => {
+                currentItem = state.inventory.find(i => i.id === itemId);
+                if (!currentItem) return;
+                renderInventoryForm(currentItem);
+            };
+            eventHandlers.handleEditInventory = handleEdit;
+            
+            const handleBarcodeScan = (e) => {
+                if (e.key === 'Enter') {
+                    const value = e.target.value.trim();
+                    if (!value) return;
+                    e.target.value = ''; // Clear input immediately
+                    
+                    const item = state.inventory.find(i => i.barcode === value);
+                    if (item) {
+                        handleEdit(item.id);
+                        state.message = `SUCCESS: Barcode ${value} found. Altering Stock Item: ${item.name}`;
+                    } else {
+                        state.message = `WARNING: Barcode ${value} not found. Creating new item with this code.`;
+                        renderInventoryForm(null, value);
+                    }
+                    render();
+                }
+            };
+            eventHandlers.handleBarcodeScanInventory = handleBarcodeScan;
+
+            const handleDelete = (itemId, itemName) => {
+                showConfirm(`Are you sure you want to delete the Stock Item: "${itemName}"? This action is permanent.`, 
+                    async () => {
+                        try {
+                            await deleteDoc(doc(state.db, Paths.INVENTORY, itemId));
+                            state.message = `SUCCESS: Stock Item "${itemName}" deleted.`;
+                            render();
+                        } catch (error) {
+                            console.error("Error deleting product:", error);
+                            state.message = 'ERROR: Failed to delete stock item.';
+                            render();
+                        }
+                    }
+                );
+            };
+            eventHandlers.handleDeleteInventory = handleDelete;
+
+            // --- Inventory Form Modal ---
+            function renderInventoryForm(item, prefilledBarcode = '') {
+                currentItem = item;
+                const title = item ? "Alter Stock Item" : "Create New Stock Item";
+                
+                const handleSubmit = async (e) => {
+                    e.preventDefault();
+                    
+                    const name = document.getElementById('itemName').value.trim();
+                    const barcode = document.getElementById('itemBarcode').value.trim();
+                    const stock = parseInt(document.getElementById('itemStock').value) || 0;
+                    const purchasePrice = parseFloat(document.getElementById('itemPPrice').value) || 0;
+                    const sellingPrice = parseFloat(document.getElementById('itemSPrice').value) || 0;
+                    const formMessage = document.getElementById('inventory-form-message');
+                    formMessage.innerHTML = '';
+                    
+                    const data = { name, barcode, stock, purchasePrice, sellingPrice, updatedBy: state.loggedInUser, updatedAt: new Date().toISOString() };
+                    
+                    if (!data.name || !data.barcode || data.stock < 0 || data.purchasePrice <= 0 || data.sellingPrice <= 0) {
+                        formMessage.innerHTML = '<p class="text-sm text-red-400 mb-3">ERROR: Please fill all fields correctly. Prices must be greater than zero.</p>';
+                        return;
+                    }
+
+                    try {
+                        if (currentItem) {
+                            await updateDoc(doc(state.db, Paths.INVENTORY, currentItem.id), data);
+                            state.message = `SUCCESS: Stock Item ${data.name} altered.`;
+                        } else {
+                            // Check for barcode duplication only on creation
+                            const existingItem = state.inventory.find(i => i.barcode === data.barcode);
+                            if (existingItem) {
+                                formMessage.innerHTML = `<p class="text-sm text-red-400 mb-3">ERROR: Barcode ${data.barcode} already exists for product ${existingItem.name}.</p>`;
+                                return;
+                            }
+                            await addDoc(collection(state.db, Paths.INVENTORY), { ...data, createdBy: state.loggedInUser, createdAt: new Date().toISOString() });
+                            state.message = `SUCCESS: New Stock Item ${data.name} created.`;
+                        }
+                        
+                        setTimeout(() => {
+                            state.isModalOpen = false;
+                            render();
+                        }, 500);
+
+                    } catch (error) {
+                        console.error("Error saving inventory:", error);
+                        formMessage.innerHTML = '<p class="text-sm text-red-400 mb-3">ERROR: Failed to save stock item.</p>';
+                    }
+                };
+                eventHandlers.handleSubmitInventory = handleSubmit;
+                
+                // Mock camera logic (since we cannot access the camera directly)
+                const handleMockCameraScan = (e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    
+                    // Simple mock: use the first 10 digits found in the filename or a default
+                    const mockBarcode = file.name.match(/\d{5,}/)?.[0] || '9999999999';
+                    document.getElementById('itemBarcode').value = mockBarcode.substring(0, 10);
+                    formMessage.innerHTML = `<p class="text-sm text-yellow-400 mb-3">Mock Scan: Barcode set to ${mockBarcode.substring(0, 10)} (from filename).</p>`;
+                    e.target.value = null; // Clear file input
+                };
+                eventHandlers.handleMockCameraScan = handleMockCameraScan;
+                
+                const formHTML = `
+                    <form onsubmit="eventHandlers.handleSubmitInventory(event)">
+                        <div id="inventory-form-message"></div>
+                        
+                        <div class="border border-sky-800 p-4 rounded-lg bg-gray-800 mb-4">
+                            <div class="flex space-x-2 mb-4">
+                                <label class="tally-btn bg-green-700 hover:bg-green-600 flex-1 text-xs sm:text-sm cursor-pointer ${currentItem ? 'opacity-50 cursor-not-allowed' : ''}">
+                                    <svg class="w-4 h-4 inline mr-1" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M4 5a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2V7a2 2 0 00-2-2h-1.586a1 1 0 01-.707-.293l-1.121-1.121A.5.5 0 0011.586 3H8.414a.5.5 0 00-.353.146L6.92 4.707A1 1 0 016.213 5H4zm8 5a2 2 0 11-4 0 2 2 0 014 0z" clip-rule="evenodd"></path></svg>
+                                    Scan with Camera (Mobile - Mock)
+                                    <input type="file" accept="image/*" capture="environment" onchange="eventHandlers.handleMockCameraScan(event)" style="display:none;" ${currentItem ? 'disabled' : ''}/>
+                                </label>
+                            </div>
+                            ${TallyInput({
+                                label: "Unique Barcode/Item Code (Required)",
+                                id: "itemBarcode",
+                                value: currentItem ? currentItem.barcode : prefilledBarcode,
+                                placeholder: "Scan or enter unique code",
+                                disabled: !!currentItem
+                            })}
+                            <p class="text-xs text-gray-500 -mt-2">Cannot change barcode after creation.</p>
+                        </div>
+                        
+                        ${TallyInput({ label: "Stock Item Name", id: "itemName", value: currentItem ? currentItem.name : '', placeholder: "e.g., Whey Protein (5lb)", autoFocus: !currentItem })}
+                        ${TallyInput({ label: "Opening/Current Stock Quantity", id: "itemStock", type: "number", value: currentItem ? currentItem.stock : 0, min: 0 })}
+                        ${TallyInput({ label: "Standard Purchase Price (Cost Price)", id: "itemPPrice", type: "number", value: currentItem ? currentItem.purchasePrice : 0, min: 0.01 })}
+                        ${TallyInput({ label: "Standard Selling Price", id: "itemSPrice", type: "number", value: currentItem ? currentItem.sellingPrice : 0, min: 0.01 })}
+
+                        ${TallyButton({ type: 'submit', children: item ? "Accept Alteration" : "Accept New Item", className: 'w-full mt-4' })}
+                    </form>
+                `;
+                state.modalContent = renderTallyModal(title, formHTML, null, false);
+                state.isModalOpen = true;
+                render();
+            }
+
+            const tableRows = state.inventory.length === 0 ? (
+                `<tr><td colspan="6" class="py-4 text-center text-gray-500">No stock items found.</td></tr>`
+            ) : state.inventory.map((item) => `
+                <tr class="bg-gray-800 border-b border-gray-700 hover:bg-gray-700 transition-colors">
+                    <td class="px-6 py-3 font-medium text-white">${item.name}</td>
+                    <td class="px-6 py-3 font-mono text-yellow-400">${item.barcode}</td>
+                    <td class="px-6 py-3 text-right font-bold ${item.stock <= 5 ? 'text-red-400' : 'text-green-400'}">${item.stock}</td>
+                    <td class="px-6 py-3 text-right">₹${item.purchasePrice.toFixed(2)}</td>
+                    <td class="px-6 py-3 text-right">₹${item.sellingPrice.toFixed(2)}</td>
+                    <td class="px-6 py-3 space-x-2">
+                        <button onclick="eventHandlers.handleEditInventory('${item.id}')" class="text-sky-400 hover:text-sky-200 text-sm">Alter</button>
+                        <button onclick="eventHandlers.handleDeleteInventory('${item.id}', '${item.name}')" class="text-red-400 hover:text-red-300 text-sm">Delete</button>
+                    </td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="p-4 bg-gray-900 min-h-full">
+                    <h2 class="text-2xl font-bold text-sky-400 mb-6 border-b border-gray-700 pb-2">Stock Master (Inventory Items)</h2>
+                    ${TallyMessage()}
+                    
+                    <p class="p-3 mb-4 text-sm font-medium text-yellow-200 bg-yellow-900 rounded">
+                        **Barcode Tip:** Use a **USB Scanner** or type the code and press **Enter** for fast searching and entry.
+                    </p>
+
+                    ${TallyInput({
+                        label: "Scan Barcode to Alter Stock Item (Press Enter)",
+                        id: "inventoryBarcodeScan",
+                        type: "text",
+                        value: '',
+                        onKeyDown: handleBarcodeScanInventory,
+                        placeholder: "Scan product barcode here...",
+                        className: "mb-4 font-mono",
+                        autoFocus: true
+                    })}
+
+                    ${TallyButton({ onClick: handleNew, children: '+ Create Stock Item (F3)', className: 'mb-6' })}
+
+                    <div class="overflow-x-auto rounded-lg shadow-xl border border-gray-700">
+                        <table class="w-full text-left text-sm text-gray-200">
+                            <thead class="text-xs uppercase bg-sky-900/50 text-sky-200 border-b border-sky-700">
+                                <tr>
+                                    <th scope="col" class="px-6 py-3">Stock Item Name</th>
+                                    <th scope="col" class="px-6 py-3">Barcode</th>
+                                    <th scope="col" class="px-6 py-3 text-right">Current Stock</th>
+                                    <th scope="col" class="px-6 py-3 text-right">Cost Price (₹)</th>
+                                    <th scope="col" class="px-6 py-3 text-right">Sale Price (₹)</th>
+                                    <th scope="col" class="px-6 py-3">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${tableRows}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                ${state.isModalOpen && state.modalContent ? state.modalContent : ''}
+            `;
+        }
+        
+        // --- Sales Voucher Entry (Executive Screen) ---
+        function renderSalesEntry() {
+            // Local state for the form (needs to be managed outside the render function)
+            let selectedPartyId = '';
+            let selectedBarcode = '';
+            let selectedItem = null;
+            let quantity = 1;
+            
+            const findItem = (barcode) => {
+                return state.inventory.find(i => i.barcode === barcode);
+            };
+
+            const handleBarcodeEntry = (e) => {
+                if (e.key === 'Enter') {
+                    const value = e.target.value.trim();
+                    selectedBarcode = value;
+                    const item = findItem(value);
+                    state.message = '';
+                    
+                    if (item) {
+                        if (item.stock > 0) {
+                            selectedItem = item;
+                            quantity = 1;
+                            document.getElementById('sales-quantity').value = 1;
+                            document.getElementById('sales-quantity').focus();
+                        } else {
+                            state.message = `ERROR: ${item.name} is Out of Stock.`;
+                            selectedItem = null;
+                        }
+                    } else {
+                        state.message = `ERROR: Barcode "${value}" not found.`;
+                        selectedItem = null;
+                    }
+                    document.getElementById('sales-barcode').value = ''; // Clear input
+                    render();
+                }
+            };
+            eventHandlers.handleSalesBarcodeEntry = handleBarcodeEntry;
+            
+            const handlePartyChange = (e) => {
+                selectedPartyId = e.target.value;
+                render();
+            };
+            eventHandlers.handleSalesPartyChange = handlePartyChange;
+            
+            const handleQuantityChange = (e) => {
+                const maxStock = selectedItem?.stock || 0;
+                let val = parseInt(e.target.value) || 1;
+                quantity = Math.min(maxStock, val);
+            };
+            eventHandlers.handleSalesQuantityChange = handleQuantityChange;
+
+            const handleRecordSale = async () => {
+                const party = state.parties.find(p => p.id === selectedPartyId);
+                
+                if (!selectedItem || !party || quantity <= 0 || quantity > selectedItem.stock) {
+                    state.message = 'ERROR: Select customer, quantity, and ensure stock is available.';
+                    render();
+                    return;
+                }
+
+                const saleData = {
+                    productId: selectedItem.id,
+                    productName: selectedItem.name,
+                    productBarcode: selectedItem.barcode,
+                    customerPartyId: selectedPartyId,
+                    customerName: party.name,
+                    quantity: Number(quantity),
+                    executiveId: state.firebaseUserId,
+                    executiveName: state.loggedInUser,
+                    status: 'Pending',
+                    executiveSuggestedPrice: selectedItem.sellingPrice,
+                    adminApprovedPrice: 0, 
+                    date: new Date().toISOString(),
+                };
+
+                try {
+                    await addDoc(collection(state.db, Paths.SALES_PENDING), saleData);
+                    state.message = `SUCCESS: Sale voucher recorded for ${party.name} and sent for Admin Approval.`;
+                    
+                    // Reset local state after submission
+                    selectedPartyId = '';
+                    selectedBarcode = '';
+                    selectedItem = null;
+                    quantity = 1;
+                    
+                    render();
+
+                } catch (error) {
+                    console.error("Error submitting pending sale:", error);
+                    state.message = 'ERROR: Failed to record sale voucher. Check console for details.';
+                    render();
+                }
+            };
+            eventHandlers.handleRecordSale = handleRecordSale;
+            
+            const handleResetForm = () => {
+                selectedPartyId = '';
+                selectedBarcode = '';
+                selectedItem = null;
+                quantity = 1;
+                state.message = 'Sale entry cleared.';
+                render();
+            };
+            eventHandlers.handleSalesResetForm = handleResetForm;
+
+            const partyOptions = [{ value: '', label: '-- Select Party Ledger --', disabled: true }, 
+                ...state.parties.map(p => ({ value: p.id, label: p.name }))
+            ];
+            
+            const itemDetailsHTML = selectedItem ? `
+                <div class="bg-gray-800 p-4 rounded-lg border border-sky-700">
+                    <h3 class="text-xl font-bold text-sky-300 mb-1">${selectedItem.name}</h3>
+                    <p class="text-sm text-gray-400">Barcode: <span class="font-mono text-yellow-400">${selectedItem.barcode}</span></p>
+                    <p class="text-sm text-gray-400">Stock Available: <span class="text-red-400 font-bold">${selectedItem.stock}</span></p>
+                    <p class="text-sm text-gray-400">Suggested Price: <span class="text-green-400 font-bold">₹${selectedItem.sellingPrice.toFixed(2)}</span></p>
+                    
+                    <div class="mt-4">
+                        ${TallyInput({
+                            label: `Quantity (Max: ${selectedItem.stock})`,
+                            id: "sales-quantity",
+                            type: "number",
+                            value: quantity,
+                            onChange: handleSalesQuantityChange,
+                            min: 1,
+                            max: selectedItem.stock
+                        })}
+                    </div>
+                </div>
+            ` : '';
+            
+            // Mock camera scan button (same as in inventory master)
+            const handleMockCameraScan = (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                
+                const mockBarcode = file.name.match(/\d{5,}/)?.[0] || '9876543210';
+                findItem(mockBarcode.substring(0, 10)); // Use existing findItem logic
+                
+                state.message = `<p class="text-sm text-yellow-400 mb-3">Mock Scan: Barcode set to ${mockBarcode.substring(0, 10)} (from filename). Press Enter.</p>`;
+                e.target.value = null; // Clear file input
+                render();
+            };
+            eventHandlers.handleMockCameraScanSales = handleMockCameraScan;
+
+            return `
+                <div class="p-4 bg-gray-900 min-h-full">
+                    <h2 class="text-2xl font-bold text-sky-400 mb-6 border-b border-gray-700 pb-2">Accounting Voucher: Sales (F8)</h2>
+                    
+                    ${TallyMessage()}
+
+                    <div class="space-y-6">
+                        ${TallySelect({
+                            label: "Party Ledger Name (Customer)",
+                            id: "customerParty",
+                            value: selectedPartyId,
+                            onChange: handleSalesPartyChange,
+                            options: partyOptions
+                        })}
+                        <p class="text-xs text-gray-500 -mt-3 mb-6">Must select a ledger before entering stock items.</p>
+                        
+                        <div class="border border-sky-800 p-4 rounded-lg bg-gray-800">
+                            <div class="flex space-x-2 mb-4">
+                                <label class="tally-btn bg-green-700 hover:bg-green-600 flex-1 text-xs sm:text-sm cursor-pointer ${selectedItem ? 'opacity-50 cursor-not-allowed' : ''}">
+                                    <svg class="w-4 h-4 inline mr-1" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M4 5a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2V7a2 2 0 00-2-2h-1.586a1 1 0 01-.707-.293l-1.121-1.121A.5.5 0 0011.586 3H8.414a.5.5 0 00-.353.146L6.92 4.707A1 1 0 016.213 5H4zm8 5a2 2 0 11-4 0 2 2 0 014 0z" clip-rule="evenodd"></path></svg>
+                                    Scan with Camera (Mobile - Mock)
+                                    <input type="file" accept="image/*" capture="environment" onchange="eventHandlers.handleMockCameraScanSales(event)" style="display:none;" ${selectedItem ? 'disabled' : ''}/>
+                                </label>
+                            </div>
+                            ${TallyInput({
+                                label: "Stock Item Code / Barcode (Press Enter)",
+                                id: "sales-barcode",
+                                type: "text",
+                                value: selectedItem ? selectedItem.name : selectedBarcode,
+                                onKeyDown: handleSalesBarcodeEntry,
+                                placeholder: "Scan or type item code and press Enter",
+                                className: "font-mono",
+                                disabled: !!selectedItem,
+                                autoFocus: true
+                            })}
+                            <p class="text-xs text-gray-500 -mt-2">Use USB scanner or type code and press Enter key.</p>
+                        </div>
+                        
+                        ${itemDetailsHTML}
+                        
+
+                        ${TallyButton({ onClick: handleRecordSale, children: 'Accept Voucher (Send for Admin Approval)', className: 'w-full mt-4', disabled: !selectedItem || !selectedPartyId || quantity > selectedItem?.stock || quantity <= 0 })}
+
+                        ${selectedItem ? `<button onclick="eventHandlers.handleSalesResetForm()" class="text-red-400 w-full mt-2 text-sm hover:text-red-200">Clear Item Entry (ESC)</button>` : ''}
+                    </div>
+                </div>
+            `;
+        }
+
+        // --- Admin Panel (Approval & Purchase Vouchers) ---
+        function renderAdminPanel() {
+            let activeTab = 'approval';
+            
+            const setActiveTab = (tab) => {
+                activeTab = tab;
+                render();
+            };
+            eventHandlers.setActiveAdminTab = setActiveTab;
+            
+            // Purchase local state
+            let purchaseItem = null;
+            let purchaseQuantity = 1;
+            let purchasePrice = 0; 
+            let vendor = '';
+            
+            const findPurchaseItem = (barcode) => {
+                return state.inventory.find(i => i.barcode === barcode);
+            };
+
+            const handlePurchaseBarcodeScan = (e) => {
+                if (e.key === 'Enter') {
+                    const value = e.target.value.trim();
+                    const item = findPurchaseItem(value);
+                    state.message = '';
+                    
+                    if (item) {
+                        purchaseItem = item;
+                        purchasePrice = item.purchasePrice; 
+                        document.getElementById('purchaseQuantity').focus();
+                    } else {
+                        state.message = `WARNING: Barcode "${value}" not found. Please create the Stock Item first (Stock Master).`;
+                        purchaseItem = null;
+                    }
+                    e.target.value = '';
+                    render();
+                }
+            };
+            eventHandlers.handlePurchaseBarcodeScan = handlePurchaseBarcodeScan;
+
+            const handleRecordPurchase = async () => {
+                const quantityVal = parseInt(document.getElementById('purchaseQuantity').value) || 0;
+                const priceVal = parseFloat(document.getElementById('purchasePrice').value) || 0;
+                const vendorVal = document.getElementById('vendor').value.trim();
+                
+                if (!purchaseItem || quantityVal <= 0 || priceVal <= 0 || !vendorVal) {
+                    state.message = 'ERROR: Please select a stock item, and enter valid quantity, price, and vendor name.';
+                    render();
+                    return;
+                }
+
+                const product = findPurchaseItem(purchaseItem.barcode);
+                const oldStock = product?.stock || 0;
+                const newStock = oldStock + quantityVal;
+                
+                try {
+                    // 1. Update Inventory Stock (and standard cost price)
+                    await updateDoc(doc(state.db, Paths.INVENTORY, product.id), {
+                        stock: newStock,
+                        purchasePrice: priceVal,
+                        updatedAt: new Date().toISOString()
+                    });
+
+                    // 2. Record Purchase Voucher Entry
+                    const purchaseData = {
+                        productId: purchaseItem.id,
+                        productName: purchaseItem.name,
+                        productBarcode: purchaseItem.barcode,
+                        quantity: quantityVal,
+                        unitPrice: priceVal,
+                        totalCost: priceVal * quantityVal,
+                        vendor: vendorVal,
+                        adminId: state.firebaseUserId,
+                        adminName: state.loggedInUser,
+                        date: new Date().toISOString(),
+                    };
+                    
+                    await addDoc(collection(state.db, Paths.SALES_APPROVED, 'purchases', 'list'), purchaseData); // Using a nested path for purchases for simplicity
+                    
+                    state.message = `SUCCESS: Purchase Voucher Accepted! Stock updated from ${oldStock} to ${newStock}.`;
+                    
+                    // Reset local purchase state
+                    purchaseItem = null;
+                    purchaseQuantity = 1;
+                    purchasePrice = 0;
+                    vendor = '';
+                    
+                    render();
+
+                } catch (error) {
+                    console.error("Error recording purchase:", error);
+                    state.message = 'ERROR: Failed to record purchase voucher. Check console for details.';
+                    render();
+                }
+            };
+            eventHandlers.handleRecordPurchase = handleRecordPurchase;
+            
+            const handleApproveSale = async (sale) => {
+                const approvedPriceStr = window.prompt(`Enter the FINAL approved selling price for ${sale.productName} (Suggested: ₹${sale.executiveSuggestedPrice.toFixed(2)}):\n\nQuantity: ${sale.quantity} \nCustomer: ${sale.customerName}`);
+                
+                const approvedPrice = parseFloat(approvedPriceStr);
+
+                if (isNaN(approvedPrice) || approvedPrice <= 0) {
+                    state.message = 'ERROR: Invalid price entered or operation cancelled. Approval cancelled.';
+                    render();
+                    return;
+                }
+
+                // 1. Check stock
+                const product = state.inventory.find(i => i.id === sale.productId);
+                if (!product || product.stock < sale.quantity) {
+                    state.message = `ERROR: Insufficient stock for ${sale.productName}. Approval denied.`;
+                    render();
+                    return;
+                }
+                
+                showConfirm(`Final Approval: Sell ${sale.quantity}x ${sale.productName} for ₹${approvedPrice.toFixed(2)} each? This deducts stock.`,
+                    async () => {
+                        try {
+                            // 2. Update Inventory Stock
+                            const newStock = product.stock - sale.quantity;
+                            await updateDoc(doc(state.db, Paths.INVENTORY, product.id), { stock: newStock });
+
+                            // 3. Move from Pending to Approved
+                            const approvedData = {
+                                ...sale,
+                                status: 'Approved',
+                                adminApprovedPrice: approvedPrice,
+                                totalRevenue: approvedPrice * sale.quantity,
+                                adminId: state.firebaseUserId,
+                                adminName: state.loggedInUser,
+                                approvalDate: new Date().toISOString()
+                            };
+
+                            await addDoc(collection(state.db, Paths.SALES_APPROVED), approvedData);
+                            await deleteDoc(doc(state.db, Paths.SALES_PENDING, sale.id));
+
+                            state.message = `SUCCESS: Sales Voucher Approved! Stock updated from ${product.stock} to ${newStock}.`;
+                            render();
+                        } catch (error) {
+                            console.error("Error approving sale:", error);
+                            state.message = 'ERROR: Failed to approve sale voucher. Check console for details.';
+                            render();
+                        }
+                    }
+                );
+            };
+            eventHandlers.handleApproveSale = handleApproveSale;
+            
+            const handleRejectSale = (saleId, itemName) => {
+                showConfirm(`Are you sure you want to REJECT the sales voucher for ${itemName}? It will be deleted permanently.`, 
+                    async () => {
+                        try {
+                            await deleteDoc(doc(state.db, Paths.SALES_PENDING, saleId));
+                            state.message = 'SUCCESS: Sales voucher rejected and deleted.';
+                            render();
+                        } catch (error) {
+                            console.error("Error rejecting sale:", error);
+                            state.message = 'ERROR: Failed to reject sale.';
+                            render();
+                        }
+                    }
+                );
+            };
+            eventHandlers.handleRejectSale = handleRejectSale;
+
+            const approvalTableRows = state.pendingSales.length === 0 ? (
+                `<tr><td colspan="4" class="py-4 text-center text-gray-500">No pending sales requiring approval.</td></tr>`
+            ) : state.pendingSales.map((sale) => `
+                <tr class="bg-gray-800 border-b border-gray-700 hover:bg-gray-700 transition-colors">
+                    <td class="px-6 py-3">
+                        <span class="font-medium text-white">${sale.productName}</span><br />
+                        <span class="text-xs text-gray-400 font-mono">Party: ${sale.customerName}</span>
+                    </td>
+                    <td class="px-6 py-3">
+                        <span class="text-yellow-400">${sale.executiveName}</span><br />
+                        <span class="text-gray-400 text-xs">Suggest: ₹${sale.executiveSuggestedPrice.toFixed(2)}</span>
+                    </td>
+                    <td class="px-6 py-3 text-right font-bold text-red-400">${sale.quantity}</td>
+                    <td class="px-6 py-3 space-y-1 flex flex-col sm:flex-row sm:space-x-2 sm:space-y-0">
+                        <button onclick="eventHandlers.handleApproveSale(${JSON.stringify(sale).replace(/"/g, '&quot;')})" class="tally-btn bg-green-600 hover:bg-green-500 text-xs">
+                            Approve (Final Rate)
+                        </button>
+                        <button onclick="eventHandlers.handleRejectSale('${sale.id}', '${sale.productName}')" class="tally-btn bg-red-600 hover:bg-red-500 text-xs">
+                            Reject
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
+            
+            const purchaseFormHTML = `
+                <div class="max-w-xl mx-auto">
+                    <h3 class="text-xl font-semibold text-white mb-4">Accounting Voucher: Purchase (F9)</h3>
+                    
+                    <p class="text-xs text-gray-400 mb-4">Add stock to inventory. Stock will automatically update.</p>
+                    
+                    <div class="border border-sky-800 p-4 rounded-lg bg-gray-800 mb-6">
+                        ${TallyInput({
+                            label: "Stock Item Code / Barcode (Press Enter to search)",
+                            id: "purchaseBarcode",
+                            type: "text",
+                            value: '',
+                            onKeyDown: handlePurchaseBarcodeScan,
+                            placeholder: "Scan or enter item code and press Enter",
+                            className: "font-mono",
+                            autoFocus: true
+                        })}
+                        <p class="text-xs text-gray-500 -mt-2">Scan item to bring up its details.</p>
+                    </div>
+                    
+                    ${purchaseItem ? `
+                        <div class="bg-gray-800 p-4 rounded-lg border border-sky-700 mb-6">
+                            <h3 class="text-xl font-bold text-sky-300 mb-1">${purchaseItem.name}</h3>
+                            <p class="text-sm text-gray-400">Current Stock: <span class="font-bold text-red-400">${findPurchaseItem(purchaseItem.barcode)?.stock || '0'}</span></p>
+                            
+                            <div class="mt-4">
+                                ${TallyInput({
+                                    label: "Quantity Purchased",
+                                    id: "purchaseQuantity",
+                                    type: "number",
+                                    value: purchaseQuantity,
+                                    onChange: (e) => purchaseQuantity = parseInt(e.target.value) || 1,
+                                    min: 1
+                                })}
+                                
+                                ${TallyInput({
+                                    label: "Unit Purchase Price (₹)",
+                                    id: "purchasePrice",
+                                    type: "number",
+                                    value: purchasePrice,
+                                    onChange: (e) => purchasePrice = parseFloat(e.target.value) || 0,
+                                    placeholder: "0.00",
+                                    min: 0.01
+                                })}
+
+                                ${TallyInput({
+                                    label: "Supplier/Vendor Ledger Name",
+                                    id: "vendor",
+                                    value: vendor,
+                                    onChange: (e) => vendor = e.target.value,
+                                    placeholder: "e.g., ABC Distributors Ledger"
+                                })}
+                            </div>
+                        </div>
+                        ${TallyButton({ onClick: handleRecordPurchase, children: 'Accept Purchase Voucher', className: 'w-full mt-6' })}
+                        <button onclick="eventHandlers.setPage('admin-panel')" class="text-red-400 w-full mt-2 text-sm hover:text-red-200">Cancel Purchase Entry (ESC)</button>
+                    ` : '<p class="text-center text-gray-500 py-4">Scan an item barcode to begin purchase entry.</p>'}
+                </div>
+            `;
+
+
+            return `
+                <div class="p-4 bg-gray-900 min-h-full">
+                    <h2 class="text-2xl font-bold text-sky-400 mb-6 border-b border-gray-700 pb-2">Admin Control Panel</h2>
+                    ${TallyMessage()}
+                    
+                    <div class="flex space-x-2 mb-6 overflow-x-auto pb-2">
+                        <button onclick="eventHandlers.setActiveAdminTab('approval')" 
+                            class="tally-btn ${activeTab === 'approval' ? 'bg-sky-500' : 'bg-gray-700 hover:bg-gray-600'}">
+                            Pending Sales Approval
+                        </button>
+                        <button onclick="eventHandlers.setActiveAdminTab('purchase')" 
+                            class="tally-btn ${activeTab === 'purchase' ? 'bg-sky-500' : 'bg-gray-700 hover:bg-gray-600'}">
+                            Purchase Voucher (F9)
+                        </button>
+                    </div>
+
+                    ${activeTab === 'approval' ? `
+                        <div>
+                            <h3 class="text-xl font-semibold text-white mb-4">Pending Sales Vouchers (${state.pendingSales.length})</h3>
+                            <div class="overflow-x-auto rounded-lg shadow-xl border border-gray-700">
+                                <table class="w-full text-left text-sm text-gray-200">
+                                    <thead class="text-xs uppercase bg-sky-900/50 text-sky-200 border-b border-sky-700">
+                                        <tr>
+                                            <th class="px-6 py-3">Item / Party</th>
+                                            <th class="px-6 py-3">Executive / Suggested Price</th>
+                                            <th class="px-6 py-3 text-right">Qty</th>
+                                            <th class="px-6 py-3">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>${approvalTableRows}</tbody>
+                                </table>
+                            </div>
+                        </div>
+                    ` : purchaseFormHTML}
+                </div>
+            `;
+        }
+
+        // --- Reports / Daybook ---
+        function renderReports() {
+            const daybook = [...state.approvedSales].sort((a, b) => new Date(b.approvalDate) - new Date(a.approvalDate));
+            const totalRevenue = daybook.reduce((acc, sale) => acc + (sale.totalRevenue || 0), 0);
+            const totalStockValue = state.inventory.reduce((acc, item) => acc + (item.purchasePrice * item.stock), 0);
+            
+            const daybookRows = daybook.length === 0 ? (
+                `<tr><td colspan="5" class="py-4 text-center text-gray-500">Daybook is empty. No approved sales recorded.</td></tr>`
+            ) : daybook.map((sale) => `
+                <tr class="bg-gray-800 border-b border-gray-700 hover:bg-gray-700 transition-colors">
+                    <td class="px-6 py-3 text-gray-400">${new Date(sale.approvalDate).toLocaleDateString('en-IN')}</td>
+                    <td class="px-6 py-3 font-medium text-white">${sale.customerName}</td>
+                    <td class="px-6 py-3">${sale.productName} (${sale.quantity} Pcs)</td>
+                    <td class="px-6 py-3 text-right text-yellow-400">₹${sale.adminApprovedPrice.toFixed(2)}</td>
+                    <td class="px-6 py-3 text-right font-bold text-green-400">₹${(sale.totalRevenue || 0).toFixed(2)}</td>
+                </tr>
+            `).join('');
+
+
+            return `
+                <div class="p-4 bg-gray-900 min-h-full">
+                    <h2 class="text-2xl font-bold text-sky-400 mb-6 border-b border-gray-700 pb-2">Display: Daybook & Stock Summary</h2>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
+                        <div class="bg-gray-800 p-4 rounded-lg border border-sky-700 shadow-lg">
+                            <p class="text-sm uppercase text-sky-300">Total Approved Revenue</p>
+                            <p class="text-3xl font-bold text-green-400 mt-1">₹${totalRevenue.toFixed(2)}</p>
+                        </div>
+                        <div class="bg-gray-800 p-4 rounded-lg border border-sky-700 shadow-lg">
+                            <p class="text-sm uppercase text-sky-300">Closing Stock Value (Cost)</p>
+                            <p class="text-3xl font-bold text-yellow-400 mt-1">₹${totalStockValue.toFixed(2)}</p>
+                        </div>
+                        <div class="bg-gray-800 p-4 rounded-lg border border-sky-700 shadow-lg">
+                            <p class="text-sm uppercase text-sky-300">Active Stock Items</p>
+                            <p class="text-3xl font-bold text-white mt-1">${state.inventory.length}</p>
+                        </div>
+                    </div>
+
+                    <h3 class="text-xl font-semibold text-white mb-4">Daybook (Approved Sales Vouchers)</h3>
+                    <div class="overflow-x-auto rounded-lg shadow-xl border border-gray-700">
+                        <table class="w-full text-left text-sm text-gray-200">
+                            <thead class="text-xs uppercase bg-sky-900/50 text-sky-200 border-b border-sky-700">
+                                <tr>
+                                    <th class="px-6 py-3">Voucher Date</th>
+                                    <th class="px-6 py-3">Party Ledger</th>
+                                    <th class="px-6 py-3">Item Name</th>
+                                    <th class="px-6 py-3 text-right">Unit Price (₹)</th>
+                                    <th class="px-6 py-3 text-right">Total Amount (₹)</th>
+                                </tr>
+                            </thead>
+                            <tbody>${daybookRows}</tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+
+        // --- MAIN RENDER LOOP ---
+        function render() {
+            let contentHTML = '';
+
+            if (!state.isAuthReady) {
+                contentHTML = `<div class="p-8 text-center text-sky-400 min-h-[80vh] flex items-center justify-center">Connecting to Cloud Server...</div>`;
+            } else if (!state.loggedInUser) {
+                contentHTML = renderLoginScreen();
+            } else {
+                switch (state.currentPage) {
+                    case 'parties':
+                        contentHTML = renderPartiesMaster();
+                        break;
+                    case 'inventory':
+                        if (state.userRole === 'admin') {
+                            contentHTML = renderInventoryMaster();
+                        }
+                        break;
+                    case 'admin-panel':
+                        if (state.userRole === 'admin') {
+                            contentHTML = renderAdminPanel();
+                        }
+                        break;
+                    case 'reports':
+                        if (state.userRole === 'admin') {
+                            contentHTML = renderReports();
+                        }
+                        break;
+                    case 'sales':
+                    default:
+                        contentHTML = renderSalesEntry();
+                        break;
+                }
+                contentHTML = renderMainLayout(contentHTML);
+            }
+
+            document.getElementById('app').innerHTML = contentHTML;
+        }
+
+        // Start the application
+        window.onload = initFirebase;
+    </script>
+</body>
+</html>
