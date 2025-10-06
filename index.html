@@ -103,54 +103,57 @@
         }
     </style>
 
-    <!-- Firebase Scripts -->
-    <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs, runTransaction, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+    <script>
+        // --- GLOBAL APP STATE AND LOCAL STORAGE SETUP ---
 
-        // --- GLOBAL APP STATE AND FIREBASE SETUP ---
-
-        // YOUR ACTUAL FIREBASE CONFIGURATION CREDENTIALS ARE INSERTED BELOW:
-        // This makes the app connect to your unique cloud database.
-        const firebaseConfig = {
-            apiKey: "AIzaSyAqwyPclIJl7aowmkXQJ9HZy5jBuCnYGmg",
-            authDomain: "hd-nutraceuticals-erp.firebaseapp.com",
-            projectId: "hd-nutraceuticals-erp",
-            storageBucket: "hd-nutraceuticals-erp.firebasestorage.app",
-            messagingSenderId: "965408530453",
-            appId: "1:965408530453:web:04d7f8af7480a003176e1c",
-            measurementId: "G-44DM120W8V" // Not used by the app logic but kept for completeness
-        };
-
-        let app, db, auth;
-        // User map (hardcoded for initial Admin)
-        const USER_MAP = {
-            // Ateeque's initial setup is handled by the initial_auth_token logic
-            'ateeque': { role: 'admin', password: 'admin123' },
-            // Add other admins/executives here if you want to use the simple login
-        };
-        const ADMIN_USERNAME = 'ateeque'; // The hardcoded initial admin username
-        const ADMIN_PASSWORD = 'admin123'; // The hardcoded initial admin password
+        // Local Storage Keys
+        const LS_INVENTORY = 'hderp_inventory';
+        const LS_PARTIES = 'hderp_parties';
+        const LS_SALES = 'hderp_sales';
+        const LS_PURCHASES = 'hderp_purchases';
 
         // Initial application state
         let state = {
-            view: 'LOADING', // LOADING, LOGIN, DASHBOARD, INVENTORY, PARTIES, SALES_VOUCHER, PURCHASE_VOUCHER
-            isAuthReady: false,
-            isAuthenticated: false,
-            user: { username: null, uid: null, role: null },
+            view: 'DASHBOARD', // We start logged in since there is no server auth
+            isAuthenticated: true,
+            user: { username: 'Ateeque', role: 'admin' }, // Hardcoded user for simplicity
             inventory: [],
             parties: [],
+            salesVouchers: [],
+            purchaseVouchers: [],
             error: null,
+            modalData: null, // For modal editing
+            
             // Voucher States
             currentVoucher: {
-                type: 'SALES', // or 'PURCHASE'
+                type: 'SALES', 
                 partyId: '',
                 items: [],
                 totalAmount: 0,
-                // Sales specific
-                executiveName: null,
-                voucherNumber: null,
+            }
+        };
+
+        // --- LOCAL STORAGE FUNCTIONS ---
+
+        const loadData = () => {
+            try {
+                state.inventory = JSON.parse(localStorage.getItem(LS_INVENTORY)) || [];
+                state.parties = JSON.parse(localStorage.getItem(LS_PARTIES)) || [];
+                state.salesVouchers = JSON.parse(localStorage.getItem(LS_SALES)) || [];
+                state.purchaseVouchers = JSON.parse(localStorage.getItem(LS_PURCHASES)) || [];
+            } catch (e) {
+                console.error("Error loading from local storage:", e);
+                state.error = "Error loading data. Data may be corrupt.";
+            }
+        };
+
+        const saveData = (key, data) => {
+            try {
+                localStorage.setItem(key, JSON.stringify(data));
+                updateState({ error: null });
+            } catch (e) {
+                console.error("Error saving to local storage:", e);
+                updateState({ error: `Error saving ${key.replace('hderp_', '')} data. Is storage full?` });
             }
         };
 
@@ -162,6 +165,10 @@
             // console.log("State Updated:", state);
         };
 
+        const generateUniqueId = () => {
+            return Date.now().toString(36) + Math.random().toString(36).substring(2);
+        };
+
         const generateVoucherNumber = (type, list) => {
             const prefix = type === 'SALES' ? 'SL' : 'PR';
             const year = new Date().getFullYear().toString().slice(-2);
@@ -169,237 +176,134 @@
             return `${prefix}/${year}/${currentCount.toString().padStart(5, '0')}`;
         };
 
-        // --- FIREBASE AUTHENTICATION ---
+        // --- INVENTORY MANAGEMENT ---
 
-        const initializeFirebase = async () => {
-            try {
-                app = initializeApp(firebaseConfig);
-                db = getFirestore(app);
-                auth = getAuth(app);
-
-                // Check auth state immediately
-                onAuthStateChanged(auth, async (user) => {
-                    if (user) {
-                        // User is signed in (either anonymously or via custom token)
-                        const userRef = doc(db, "users", user.uid);
-                        const userSnap = await getDoc(userRef);
-                        
-                        let userData;
-                        if (userSnap.exists()) {
-                            userData = userSnap.data();
-                        } else {
-                            // If user is new (e.g., first anonymous sign-in), create basic profile
-                            userData = { username: ADMIN_USERNAME, role: 'admin' };
-                            await setDoc(userRef, userData, { merge: true });
-                        }
-
-                        updateState({
-                            isAuthReady: true,
-                            isAuthenticated: true,
-                            user: {
-                                username: userData.username || ADMIN_USERNAME,
-                                uid: user.uid,
-                                role: userData.role || 'admin'
-                            },
-                            view: 'DASHBOARD'
-                        });
-                        setupDataListeners();
-                    } else {
-                        // Attempt silent sign-in (anonymous for initial security rules)
-                        await signInAnonymously(auth);
-                        // The onAuthStateChanged listener will handle the resulting sign-in
-                    }
-                });
-
-            } catch (error) {
-                console.error("Firebase Initialization Failed:", error);
-                updateState({ view: 'LOGIN', error: `Connection Error: ${error.message}` });
-            }
-        };
-
-        const handleLogin = async (username, password) => {
-            username = username.toLowerCase();
-            const userRef = doc(db, "users", auth.currentUser.uid);
-
-            if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-                // Admin Login: Update the anonymous user profile to reflect Admin role
-                try {
-                    await setDoc(userRef, { username: ADMIN_USERNAME, role: 'admin' }, { merge: true });
-                    updateState({
-                        isAuthenticated: true,
-                        user: { username: ADMIN_USERNAME, uid: auth.currentUser.uid, role: 'admin' },
-                        view: 'DASHBOARD',
-                        error: null
-                    });
-                } catch (e) {
-                    console.error("Login Failed:", e);
-                    updateState({ error: `Login update failed: ${e.message}` });
-                }
-            } else {
-                updateState({ error: 'Invalid Username or Password for Admin.' });
-            }
-        };
-
-        // --- FIREBASE DATA LISTENERS ---
-
-        const setupDataListeners = () => {
-            if (!state.user.uid) return;
-
-            // 1. Inventory Listener (Public Data)
-            const inventoryPath = `/artifacts/${firebaseConfig.projectId}/public/data/inventory_items`;
-            const inventoryQuery = query(collection(db, inventoryPath));
-            onSnapshot(inventoryQuery, (snapshot) => {
-                const inventory = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                updateState({ inventory });
-            }, (error) => console.error("Inventory Snapshot Error:", error));
-
-            // 2. Parties (Customers/Suppliers) Listener (Public Data)
-            const partiesPath = `/artifacts/${firebaseConfig.projectId}/public/data/parties`;
-            const partiesQuery = query(collection(db, partiesPath));
-            onSnapshot(partiesQuery, (snapshot) => {
-                const parties = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                updateState({ parties });
-            }, (error) => console.error("Parties Snapshot Error:", error));
-
-            // 3. Sales Voucher Listener (Public Data) - For reporting and audit
-            const salesPath = `/artifacts/${firebaseConfig.projectId}/public/data/sales_vouchers`;
-            const salesQuery = query(collection(db, salesPath));
-            onSnapshot(salesQuery, (snapshot) => {
-                const sales = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                updateState({ salesVouchers: sales });
-            }, (error) => console.error("Sales Snapshot Error:", error));
-
-            // 4. Purchase Voucher Listener (Public Data) - For reporting and audit
-            const purchasePath = `/artifacts/${firebaseConfig.projectId}/public/data/purchase_vouchers`;
-            const purchaseQuery = query(collection(db, purchasePath));
-            onSnapshot(purchaseQuery, (snapshot) => {
-                const purchases = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                updateState({ purchaseVouchers: purchases });
-            }, (error) => console.error("Purchase Snapshot Error:", error));
-        };
-
-        // --- DATA ENTRY FUNCTIONS (ADMIN/VOUCHER) ---
-
-        const addUpdateInventoryItem = async (item) => {
-            if (state.user.role !== 'admin') {
-                updateState({ error: 'Permission denied. Only Admin can manage inventory.' });
-                return;
-            }
+        const addUpdateInventoryItem = (item) => {
             if (!item.name || !item.barcode || isNaN(item.stock) || isNaN(item.sellingPrice) || isNaN(item.purchasePrice)) {
                 updateState({ error: 'All inventory fields are required and must be valid numbers.' });
                 return;
             }
 
-            const path = `/artifacts/${firebaseConfig.projectId}/public/data/inventory_items`;
-            const itemRef = item.id ? doc(db, path, item.id) : doc(collection(db, path));
+            const parsedItem = {
+                name: item.name,
+                barcode: item.barcode.toUpperCase(),
+                stock: parseFloat(item.stock),
+                sellingPrice: parseFloat(item.sellingPrice),
+                purchasePrice: parseFloat(item.purchasePrice),
+            };
 
-            try {
-                const data = {
-                    name: item.name,
-                    barcode: item.barcode.toUpperCase(),
-                    stock: parseFloat(item.stock),
-                    sellingPrice: parseFloat(item.sellingPrice),
-                    purchasePrice: parseFloat(item.purchasePrice),
-                    updatedAt: serverTimestamp(),
-                };
-
-                if (!item.id) {
-                    data.createdAt = serverTimestamp();
+            if (item.id) {
+                // Update existing item
+                const index = state.inventory.findIndex(i => i.id === item.id);
+                if (index !== -1) {
+                    state.inventory[index] = { ...state.inventory[index], ...parsedItem };
                 }
-
-                await setDoc(itemRef, data, { merge: true });
-                updateState({ error: null });
-            } catch (e) {
-                updateState({ error: `Inventory save failed: ${e.message}` });
+            } else {
+                // Add new item
+                state.inventory.push({ ...parsedItem, id: generateUniqueId() });
             }
+
+            saveData(LS_INVENTORY, state.inventory);
+            updateState({ inventory: state.inventory, error: "Inventory updated successfully." });
         };
 
-        const addUpdateParty = async (party) => {
+        // --- PARTY MANAGEMENT ---
+        
+        const addUpdateParty = (party) => {
             if (!party.name || !party.type) {
                 updateState({ error: 'Party name and type are required.' });
                 return;
             }
-            const path = `/artifacts/${firebaseConfig.projectId}/public/data/parties`;
-            const partyRef = party.id ? doc(db, path, party.id) : doc(collection(db, path));
+            
+            const newParty = {
+                name: party.name,
+                type: party.type,
+                address: party.address || '',
+                phone: party.phone || '',
+            };
 
-            try {
-                const data = {
-                    name: party.name,
-                    type: party.type,
-                    address: party.address || '',
-                    phone: party.phone || '',
-                    updatedAt: serverTimestamp(),
-                };
-
-                if (!party.id) {
-                    data.createdAt = serverTimestamp();
+            if (party.id) {
+                // Update existing item
+                const index = state.parties.findIndex(p => p.id === party.id);
+                if (index !== -1) {
+                    state.parties[index] = { ...state.parties[index], ...newParty };
                 }
-
-                await setDoc(partyRef, data, { merge: true });
-                updateState({ error: null });
-            } catch (e) {
-                updateState({ error: `Party save failed: ${e.message}` });
+            } else {
+                // Add new item
+                state.parties.push({ ...newParty, id: generateUniqueId() });
             }
+            
+            saveData(LS_PARTIES, state.parties);
+            updateState({ parties: state.parties, error: "Party updated successfully." });
         };
 
-        const recordVoucher = async (voucher) => {
-            const isSales = voucher.type === 'SALES';
-            const path = `/artifacts/${firebaseConfig.projectId}/public/data/${isSales ? 'sales_vouchers' : 'purchase_vouchers'}`;
+        // --- VOUCHER RECORDING ---
 
+        const recordVoucher = (voucher) => {
+            const isSales = voucher.type === 'SALES';
+            const voucherListKey = isSales ? LS_SALES : LS_PURCHASES;
+            let currentList = isSales ? state.salesVouchers : state.purchaseVouchers;
+            
             if (!voucher.partyId || voucher.items.length === 0) {
                 updateState({ error: 'Voucher requires a party and at least one item.' });
                 return;
             }
-            
-            // Get current count for voucher number generation (simple non-guaranteed method)
-            const collectionSnap = await getDocs(collection(db, path));
-            const voucherNumber = generateVoucherNumber(voucher.type, collectionSnap.docs);
 
-            try {
-                await runTransaction(db, async (transaction) => {
-                    const voucherRef = doc(collection(db, path));
-                    const newVoucher = {
-                        ...voucher,
-                        voucherNumber: voucherNumber,
-                        recordedBy: state.user.username,
-                        recordedById: auth.currentUser.uid,
-                        createdAt: serverTimestamp(),
-                    };
-                    transaction.set(voucherRef, newVoucher);
+            const inventoryCopy = [...state.inventory];
+            let error = null;
 
-                    // Update Inventory Stock within the transaction
-                    for (const item of voucher.items) {
-                        const itemRef = doc(db, `/artifacts/${firebaseConfig.projectId}/public/data/inventory_items`, item.itemId);
-                        const itemSnap = await transaction.get(itemRef);
-
-                        if (!itemSnap.exists()) {
-                            throw new Error(`Item with ID ${item.itemId} not found.`);
-                        }
-
-                        const currentStock = itemSnap.data().stock || 0;
-                        let newStock;
-
-                        if (isSales) {
-                            newStock = currentStock - item.quantity;
-                            if (newStock < 0) {
-                                throw new Error(`Insufficient stock for item: ${item.name}. Available: ${currentStock}`);
-                            }
-                        } else { // Purchase
-                            newStock = currentStock + item.quantity;
-                        }
-
-                        transaction.update(itemRef, { stock: newStock });
+            // 1. Check stock and prepare new inventory state
+            for (const item of voucher.items) {
+                const invIndex = inventoryCopy.findIndex(i => i.id === item.itemId);
+                if (invIndex === -1) {
+                    error = `Item ID ${item.itemId} not found.`;
+                    break;
+                }
+                
+                let newStock;
+                if (isSales) {
+                    newStock = inventoryCopy[invIndex].stock - item.quantity;
+                    if (newStock < 0) {
+                        error = `Insufficient stock for item: ${item.name}. Available: ${inventoryCopy[invIndex].stock}`;
+                        break;
                     }
-                });
-
-                updateState({ error: `Voucher ${voucherNumber} recorded successfully!`, currentVoucher: { type: voucher.type, partyId: '', items: [], totalAmount: 0 } });
-            } catch (e) {
-                updateState({ error: `Voucher transaction failed: ${e.message}` });
-                console.error("Transaction failed: ", e);
+                } else { // Purchase
+                    newStock = inventoryCopy[invIndex].stock + item.quantity;
+                }
+                
+                inventoryCopy[invIndex].stock = newStock;
             }
+
+            if (error) {
+                updateState({ error });
+                return;
+            }
+            
+            // 2. Record Voucher
+            const newVoucher = {
+                ...voucher,
+                id: generateUniqueId(),
+                voucherNumber: generateVoucherNumber(voucher.type, currentList),
+                recordedBy: state.user.username,
+                createdAt: new Date().toISOString(),
+            };
+
+            currentList.push(newVoucher);
+            
+            // 3. Save all changes
+            saveData(voucherListKey, currentList);
+            saveData(LS_INVENTORY, inventoryCopy);
+
+            updateState({ 
+                inventory: inventoryCopy, 
+                salesVouchers: isSales ? currentList : state.salesVouchers,
+                purchaseVouchers: !isSales ? currentList : state.purchaseVouchers,
+                error: `Voucher ${newVoucher.voucherNumber} recorded successfully!`, 
+                currentVoucher: { type: voucher.type, partyId: '', items: [], totalAmount: 0 } 
+            });
         };
 
-        // --- RENDER FUNCTIONS ---
+        // --- RENDER HELPERS ---
 
         const getCurrency = (amount) => `₹ ${parseFloat(amount).toFixed(2)}`;
 
@@ -407,6 +311,13 @@
             <div class="tally-menu w-64 p-4 flex flex-col h-full">
                 <h1 class="text-xl font-bold text-white mb-6 border-b border-gray-700 pb-2">HDN ERP</h1>
                 
+                <div class="mb-4">
+                    <h2 class="text-xs text-gray-400 uppercase mb-1">Navigation</h2>
+                    <div class="tally-menu-item ${state.view === 'DASHBOARD' ? 'active' : ''}" onclick="window.updateState({view: 'DASHBOARD'})">
+                        Dashboard
+                    </div>
+                </div>
+
                 <div class="mb-4">
                     <h2 class="text-xs text-gray-400 uppercase mb-1">Masters</h2>
                     <div class="tally-menu-item ${state.view === 'INVENTORY' ? 'active' : ''}" onclick="window.updateState({view: 'INVENTORY'})">
@@ -429,10 +340,7 @@
 
                 <div class="mt-auto pt-4 border-t border-gray-700">
                     <div class="text-sm text-gray-300">User: ${state.user.username} (${state.user.role})</div>
-                    <button onclick="window.updateState({view: 'LOGIN', isAuthenticated: false, user: { username: null, uid: null, role: null }})" 
-                            class="w-full mt-2 btn-secondary">
-                        Logout
-                    </button>
+                    <p class="text-xs text-yellow-400 mt-1">Data saved only in this browser.</p>
                 </div>
             </div>
         `;
@@ -446,42 +354,13 @@
             </div>
         `;
 
-        const renderLogin = () => `
-            <div class="min-h-screen flex items-center justify-center p-4">
-                <div class="tally-panel w-full max-w-md p-8 space-y-6">
-                    <div class="text-center">
-                        <h2 class="text-3xl font-bold text-white">HD NUTRACEUTICALS ERP</h2>
-                        <p class="mt-2 text-gray-300">Tally-Style Connected System</p>
-                    </div>
-
-                    ${state.error ? `<div class="p-3 bg-red-800 text-white rounded-md">${state.error}</div>` : ''}
-
-                    <div class="space-y-4">
-                        <div>
-                            <label for="username" class="block text-sm font-medium text-gray-300">Username</label>
-                            <input type="text" id="username" class="tally-input w-full mt-1" value="Ateeque" required>
-                        </div>
-                        <div>
-                            <label for="password" class="block text-sm font-medium text-gray-300">Password</label>
-                            <input type="password" id="password" class="tally-input w-full mt-1" value="admin123" required>
-                            <p class="text-xs text-gray-400 mt-1">Default Admin: Ateeque / admin123</p>
-                        </div>
-                        <button onclick="window.handleLogin(document.getElementById('username').value, document.getElementById('password').value)"
-                                class="w-full btn-primary text-lg">
-                            Login
-                        </button>
-                    </div>
-                </div>
-            </div>
-        `;
-
         const renderDashboard = () => `
             <div class="flex-1 p-8">
                 ${Header('Dashboard')}
                 <div class="mt-8 grid grid-cols-1 md:grid-cols-3 gap-6">
                     <!-- Cards will go here -->
                     <div class="tally-panel p-6 bg-blue-900">
-                        <h3 class="text-xl font-semibold mb-2">Total Inventory Value</h3>
+                        <h3 class="text-xl font-semibold mb-2">Total Inventory Value (Selling)</h3>
                         <p class="text-3xl font-bold text-tally-green">${getCurrency(state.inventory.reduce((sum, item) => sum + (item.stock * item.sellingPrice), 0))}</p>
                     </div>
                     <div class="tally-panel p-6 bg-red-900">
@@ -490,15 +369,63 @@
                     </div>
                     <div class="tally-panel p-6 bg-green-900">
                         <h3 class="text-xl font-semibold mb-2">Sales Vouchers</h3>
-                        <p class="text-3xl font-bold">${state.salesVouchers ? state.salesVouchers.length : 0}</p>
+                        <p class="text-3xl font-bold">${state.salesVouchers.length}</p>
                     </div>
+                </div>
+                ${state.error ? `<div class="mt-4 p-3 bg-green-800 text-white rounded-md">${state.error}</div>` : ''}
+                <div class="mt-8 text-yellow-300 p-4 border border-yellow-500 rounded-md">
+                    <p class="font-bold">IMPORTANT:</p>
+                    <p>This version uses Local Storage. All data is saved ONLY on this specific browser and device. Clearing browser data will delete all ERP records.</p>
                 </div>
             </div>
         `;
 
+        // --- MODAL CONTROLS (for Inventory & Parties) ---
+        
+        window.openInventoryModal = (item = null) => {
+            updateState({ modalData: item });
+        };
+
+        window.closeInventoryModal = () => {
+            updateState({ modalData: null });
+        };
+
+        window.saveInventoryItem = () => {
+            const item = {
+                id: state.modalData?.id,
+                name: document.getElementById('itemName').value,
+                barcode: document.getElementById('itemBarcode').value,
+                stock: document.getElementById('itemStock').value,
+                sellingPrice: document.getElementById('itemSellingPrice').value,
+                purchasePrice: document.getElementById('itemPurchasePrice').value,
+            };
+            window.addUpdateInventoryItem(item);
+            window.closeInventoryModal();
+        };
+        
+        window.openPartyModal = (party = null) => {
+            updateState({ modalData: party });
+        };
+
+        window.closePartyModal = () => {
+            updateState({ modalData: null });
+        };
+
+        window.saveParty = () => {
+            const party = {
+                id: state.modalData?.id,
+                name: document.getElementById('partyName').value,
+                type: document.getElementById('partyType').value,
+                phone: document.getElementById('partyPhone').value,
+                address: document.getElementById('partyAddress').value,
+            };
+            window.addUpdateParty(party);
+            window.closePartyModal();
+        };
+
+        // --- INVENTORY MASTER RENDER ---
+
         const renderInventoryMaster = () => {
-            if (state.user.role !== 'admin') return '<div class="p-8 text-red-500">Access Denied. Only Admin can view Inventory Master.</div>';
-            
             const tableRows = state.inventory.map(item => `
                 <tr class="hover:bg-gray-700 cursor-pointer" onclick="window.openInventoryModal(${JSON.stringify(item).replace(/"/g, '&quot;')})">
                     <td class="p-3">${item.name}</td>
@@ -509,10 +436,58 @@
                 </tr>
             `).join('');
 
+            const renderModal = () => {
+                const item = state.modalData || {};
+                const isEdit = !!item.id;
+                
+                return `
+                    <div id="inventoryModal" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 ${state.modalData ? '' : 'hidden'}">
+                        <div class="tally-panel w-full max-w-lg p-6 space-y-4">
+                            <h3 class="text-2xl font-bold border-b pb-2">${isEdit ? 'Edit Stock Item' : 'Create New Stock Item'}</h3>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-300">Item Name</label>
+                                <input type="text" id="itemName" class="tally-input w-full mt-1" value="${item.name || ''}" required>
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-300">Barcode / SKU</label>
+                                <input type="text" id="itemBarcode" class="tally-input w-full mt-1" value="${item.barcode || ''}" required>
+                            </div>
+                            
+                            <div class="grid grid-cols-3 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-300">Initial Stock</label>
+                                    <input type="number" id="itemStock" class="tally-input w-full mt-1" value="${item.stock || 0}" ${isEdit ? 'disabled' : ''} required>
+                                    ${isEdit ? '<p class="text-xs text-yellow-300 mt-1">Stock is managed via Vouchers (Purchase/Sale).</p>' : ''}
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-300">Selling Price (₹)</label>
+                                    <input type="number" id="itemSellingPrice" class="tally-input w-full mt-1" value="${item.sellingPrice || 0}" step="0.01" required>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-300">Purchase Price (₹)</label>
+                                    <input type="number" id="itemPurchasePrice" class="tally-input w-full mt-1" value="${item.purchasePrice || 0}" step="0.01" required>
+                                </div>
+                            </div>
+
+                            <div class="flex justify-end space-x-4 pt-4">
+                                <button onclick="window.closeInventoryModal()" class="btn-secondary tally-button">
+                                    Cancel (Esc)
+                                </button>
+                                <button onclick="window.saveInventoryItem()" class="btn-primary tally-button">
+                                    ${isEdit ? 'Update Item' : 'Save Item'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            };
+
             return `
                 <div class="flex-1 p-8">
                     ${Header('Inventory Master (Stock Items)')}
-                    ${state.error ? `<div class="mt-4 p-3 bg-red-800 text-white rounded-md">${state.error}</div>` : ''}
+                    ${state.error ? `<div class="mt-4 p-3 bg-green-800 text-white rounded-md">${state.error}</div>` : ''}
 
                     <div class="mt-4 flex justify-end">
                         <button onclick="window.openInventoryModal()" class="btn-primary tally-button">
@@ -537,86 +512,13 @@
                         </table>
                     </div>
                 </div>
-                ${renderInventoryModal()}
+                ${renderModal()}
             `;
         };
 
-        const renderInventoryModal = () => {
-            const item = state.modalData || {};
-            const isEdit = !!item.id;
-            
-            return `
-                <div id="inventoryModal" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 ${state.modalData ? '' : 'hidden'}">
-                    <div class="tally-panel w-full max-w-lg p-6 space-y-4">
-                        <h3 class="text-2xl font-bold border-b pb-2">${isEdit ? 'Edit Stock Item' : 'Create New Stock Item'}</h3>
-                        
-                        <div>
-                            <label class="block text-sm font-medium text-gray-300">Item Name</label>
-                            <input type="text" id="itemName" class="tally-input w-full mt-1" value="${item.name || ''}" required>
-                        </div>
-                        
-                        <div>
-                            <label class="block text-sm font-medium text-gray-300">Barcode / SKU</label>
-                            <input type="text" id="itemBarcode" class="tally-input w-full mt-1" value="${item.barcode || ''}" required>
-                        </div>
-                        
-                        <div class="grid grid-cols-3 gap-4">
-                            <div>
-                                <label class="block text-sm font-medium text-gray-300">Initial Stock</label>
-                                <input type="number" id="itemStock" class="tally-input w-full mt-1" value="${item.stock || 0}" ${isEdit ? 'disabled' : ''} required>
-                                ${isEdit ? '<p class="text-xs text-yellow-300 mt-1">Stock is managed via Vouchers (Purchase/Sale).</p>' : ''}
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium text-gray-300">Selling Price (₹)</label>
-                                <input type="number" id="itemSellingPrice" class="tally-input w-full mt-1" value="${item.sellingPrice || 0}" step="0.01" required>
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium text-gray-300">Purchase Price (₹)</label>
-                                <input type="number" id="itemPurchasePrice" class="tally-input w-full mt-1" value="${item.purchasePrice || 0}" step="0.01" required>
-                            </div>
-                        </div>
+        // --- PARTY MASTER RENDER ---
 
-                        <div class="flex justify-end space-x-4 pt-4">
-                            <button onclick="window.closeInventoryModal()" class="btn-secondary tally-button">
-                                Cancel (Esc)
-                            </button>
-                            <button onclick="window.saveInventoryItem()" class="btn-primary tally-button">
-                                ${isEdit ? 'Update Item' : 'Save Item'}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            `;
-        };
-
-        // --- MODAL CONTROLS (for Inventory & Parties) ---
-        
-        window.openInventoryModal = (item = null) => {
-            updateState({ modalData: item });
-        };
-
-        window.closeInventoryModal = () => {
-            updateState({ modalData: null });
-        };
-
-        window.saveInventoryItem = () => {
-            const item = {
-                id: state.modalData?.id,
-                name: document.getElementById('itemName').value,
-                barcode: document.getElementById('itemBarcode').value,
-                stock: document.getElementById('itemStock').value,
-                sellingPrice: document.getElementById('itemSellingPrice').value,
-                purchasePrice: document.getElementById('itemPurchasePrice').value,
-            };
-            window.addUpdateInventoryItem(item);
-            window.closeInventoryModal();
-        };
-
-        // --- PARTY MASTER ---
-        
         const renderPartyMaster = () => {
-            if (state.user.role !== 'admin') return '<div class="p-8 text-red-500">Access Denied. Only Admin can view Party Master.</div>';
-
             const tableRows = state.parties.map(party => `
                 <tr class="hover:bg-gray-700 cursor-pointer" onclick="window.openPartyModal(${JSON.stringify(party).replace(/"/g, '&quot;')})">
                     <td class="p-3">${party.name}</td>
@@ -626,10 +528,55 @@
                 </tr>
             `).join('');
 
+            const renderModal = () => {
+                const party = state.modalData || {};
+                const isEdit = !!party.id;
+                
+                return `
+                    <div id="partyModal" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 ${state.modalData ? '' : 'hidden'}">
+                        <div class="tally-panel w-full max-w-lg p-6 space-y-4">
+                            <h3 class="text-2xl font-bold border-b pb-2">${isEdit ? 'Edit Party' : 'Create New Party'}</h3>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-300">Party Name</label>
+                                <input type="text" id="partyName" class="tally-input w-full mt-1" value="${party.name || ''}" required>
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-300">Party Type</label>
+                                <select id="partyType" class="tally-input w-full mt-1" required>
+                                    <option value="Customer" ${party.type === 'Customer' ? 'selected' : ''}>Customer</option>
+                                    <option value="Supplier" ${party.type === 'Supplier' ? 'selected' : ''}>Supplier</option>
+                                    <option value="Both" ${party.type === 'Both' ? 'selected' : ''}>Both</option>
+                                </select>
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-300">Phone</label>
+                                <input type="text" id="partyPhone" class="tally-input w-full mt-1" value="${party.phone || ''}">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-300">Address</label>
+                                <textarea id="partyAddress" class="tally-input w-full mt-1">${party.address || ''}</textarea>
+                            </div>
+
+                            <div class="flex justify-end space-x-4 pt-4">
+                                <button onclick="window.closePartyModal()" class="btn-secondary tally-button">
+                                    Cancel (Esc)
+                                </button>
+                                <button onclick="window.saveParty()" class="btn-primary tally-button">
+                                    ${isEdit ? 'Update Party' : 'Save Party'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            };
+
             return `
                 <div class="flex-1 p-8">
                     ${Header('Party Master (Customers/Suppliers)')}
-                    ${state.error ? `<div class="mt-4 p-3 bg-red-800 text-white rounded-md">${state.error}</div>` : ''}
+                    ${state.error ? `<div class="mt-4 p-3 bg-green-800 text-white rounded-md">${state.error}</div>` : ''}
 
                     <div class="mt-4 flex justify-end">
                         <button onclick="window.openPartyModal()" class="btn-primary tally-button">
@@ -653,75 +600,10 @@
                         </table>
                     </div>
                 </div>
-                ${renderPartyModal()}
+                ${renderModal()}
             `;
         };
-
-        const renderPartyModal = () => {
-            const party = state.modalData || {};
-            const isEdit = !!party.id;
-            
-            return `
-                <div id="partyModal" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 ${state.modalData ? '' : 'hidden'}">
-                    <div class="tally-panel w-full max-w-lg p-6 space-y-4">
-                        <h3 class="text-2xl font-bold border-b pb-2">${isEdit ? 'Edit Party' : 'Create New Party'}</h3>
-                        
-                        <div>
-                            <label class="block text-sm font-medium text-gray-300">Party Name</label>
-                            <input type="text" id="partyName" class="tally-input w-full mt-1" value="${party.name || ''}" required>
-                        </div>
-                        
-                        <div>
-                            <label class="block text-sm font-medium text-gray-300">Party Type</label>
-                            <select id="partyType" class="tally-input w-full mt-1" required>
-                                <option value="Customer" ${party.type === 'Customer' ? 'selected' : ''}>Customer</option>
-                                <option value="Supplier" ${party.type === 'Supplier' ? 'selected' : ''}>Supplier</option>
-                                <option value="Both" ${party.type === 'Both' ? 'selected' : ''}>Both</option>
-                            </select>
-                        </div>
-                        
-                        <div>
-                            <label class="block text-sm font-medium text-gray-300">Phone</label>
-                            <input type="text" id="partyPhone" class="tally-input w-full mt-1" value="${party.phone || ''}">
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-300">Address</label>
-                            <textarea id="partyAddress" class="tally-input w-full mt-1">${party.address || ''}</textarea>
-                        </div>
-
-                        <div class="flex justify-end space-x-4 pt-4">
-                            <button onclick="window.closePartyModal()" class="btn-secondary tally-button">
-                                Cancel (Esc)
-                            </button>
-                            <button onclick="window.saveParty()" class="btn-primary tally-button">
-                                ${isEdit ? 'Update Party' : 'Save Party'}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            `;
-        };
-
-        window.openPartyModal = (party = null) => {
-            updateState({ modalData: party });
-        };
-
-        window.closePartyModal = () => {
-            updateState({ modalData: null });
-        };
-
-        window.saveParty = () => {
-            const party = {
-                id: state.modalData?.id,
-                name: document.getElementById('partyName').value,
-                type: document.getElementById('partyType').value,
-                phone: document.getElementById('partyPhone').value,
-                address: document.getElementById('partyAddress').value,
-            };
-            window.addUpdateParty(party);
-            window.closePartyModal();
-        };
-
+        
         // --- VOUCHER ENTRY ---
 
         const renderVoucherEntry = (type) => {
@@ -751,14 +633,14 @@
             return `
                 <div class="flex-1 p-8">
                     ${Header(title)}
-                    ${state.error ? `<div class="mt-4 p-3 bg-red-800 text-white rounded-md">${state.error}</div>` : ''}
+                    ${state.error ? `<div class="mt-4 p-3 ${state.error.includes('successfully') ? 'bg-green-800' : 'bg-red-800'} text-white rounded-md">${state.error}</div>` : ''}
 
                     <!-- Header/Party Details -->
                     <div class="mt-4 tally-panel p-4">
                         <div class="grid grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-sm font-medium text-gray-300">Voucher Number</label>
-                                <p class="text-lg font-bold">${state.currentVoucher.voucherNumber || generateVoucherNumber(type, state.salesVouchers || [])}</p>
+                                <p class="text-lg font-bold">${generateVoucherNumber(type, isSales ? state.salesVouchers : state.purchaseVouchers)}</p>
                             </div>
                             <div>
                                 <label class="block text-sm font-medium text-gray-300">Party Name (${partyTypeFilter})</label>
@@ -777,11 +659,9 @@
                             <input type="text" id="barcodeInput" placeholder="Scan Barcode / Enter Manually" 
                                    onkeydown="window.handleBarcodeInput(event, '${type}')" 
                                    class="tally-input flex-1">
-                            <button onclick="document.getElementById('cameraInput').click()" class="btn-icon tally-button">
-                                📸 Scan with Camera (Mobile)
+                            <button onclick="window.showConfirmationModal('scan')" class="btn-icon tally-button">
+                                📸 Scan with Camera (Mobile Mock)
                             </button>
-                            <input type="file" id="cameraInput" accept="image/*" capture="environment" style="display: none;" 
-                                   onchange="window.handleCameraScan(event, '${type}')">
                         </div>
                     </div>
 
@@ -817,40 +697,26 @@
                         <button onclick="window.updateState({view: 'DASHBOARD'})" class="btn-secondary tally-button">
                             Cancel (Esc)
                         </button>
-                        <button onclick="window.confirmVoucherRecord('${type}')" class="btn-primary tally-button">
+                        <button onclick="window.showConfirmationModal('record', '${type}')" class="btn-primary tally-button">
                             ${buttonText} (Save)
                         </button>
                     </div>
                 </div>
+                ${renderConfirmationModal()}
             `;
         };
 
         window.updateCurrentVoucherParty = (partyId) => {
-            window.updateState({ currentVoucher: { ...state.currentVoucher, partyId: partyId } });
+            const newVoucher = { ...state.currentVoucher, partyId: partyId };
+            window.updateState({ currentVoucher: newVoucher });
         };
 
         window.handleBarcodeInput = (event, type) => {
             if (event.key === 'Enter') {
                 event.preventDefault();
-                const barcode = event.target.value.toUpperCase();
+                const barcode = event.target.value.toUpperCase().trim();
                 event.target.value = ''; // Clear input immediately
                 window.addItemToVoucher(barcode, type);
-            }
-        };
-
-        window.handleCameraScan = (event, type) => {
-            const file = event.target.files[0];
-            if (file) {
-                // Mock decoder: Assume the barcode is the first 8 digits in the filename (typical for testing)
-                const filename = file.name.toUpperCase();
-                const mockBarcodeMatch = filename.match(/\d{8}/);
-                const mockBarcode = mockBarcodeMatch ? mockBarcodeMatch[0] : null;
-
-                if (mockBarcode) {
-                    window.addItemToVoucher(mockBarcode, type);
-                } else {
-                    updateState({ error: "Mock scanner failed. Please manually enter the barcode." });
-                }
             }
         };
 
@@ -865,14 +731,11 @@
             const existingIndex = state.currentVoucher.items.findIndex(i => i.barcode === barcode);
             
             const priceKey = type === 'SALES' ? 'sellingPrice' : 'purchasePrice';
+            const currentItems = [...state.currentVoucher.items];
 
             if (existingIndex >= 0) {
                 // Increment quantity if item already exists
-                const newItems = [...state.currentVoucher.items];
-                newItems[existingIndex].quantity += 1;
-                
-                const totalAmount = newItems.reduce((sum, i) => sum + (i.quantity * i.price), 0);
-                window.updateState({ currentVoucher: { ...state.currentVoucher, items: newItems, totalAmount } });
+                currentItems[existingIndex].quantity += 1;
             } else {
                 // Add new item
                 const newItem = {
@@ -882,17 +745,19 @@
                     quantity: 1,
                     price: item[priceKey],
                 };
-                
-                const newItems = [...state.currentVoucher.items, newItem];
-                const totalAmount = newItems.reduce((sum, i) => sum + (i.quantity * i.price), 0);
-                window.updateState({ currentVoucher: { ...state.currentVoucher, items: newItems, totalAmount } });
+                currentItems.push(newItem);
             }
-            updateState({ error: null });
+            
+            const totalAmount = currentItems.reduce((sum, i) => sum + (i.quantity * i.price), 0);
+            window.updateState({ 
+                currentVoucher: { ...state.currentVoucher, items: currentItems, totalAmount },
+                error: null 
+            });
         };
 
         window.updateVoucherItemQuantity = (index, newQty) => {
             newQty = parseInt(newQty) || 0;
-            if (newQty <= 0) return;
+            if (newQty < 1) return; // Disallow zero/negative quantity
 
             const newItems = [...state.currentVoucher.items];
             newItems[index].quantity = newQty;
@@ -907,28 +772,76 @@
             window.updateState({ currentVoucher: { ...state.currentVoucher, items: newItems, totalAmount } });
         };
 
-        window.confirmVoucherRecord = (type) => {
-            if (!state.currentVoucher.partyId) {
-                updateState({ error: 'Please select a Party before recording the voucher.' });
-                return;
-            }
-            if (state.currentVoucher.items.length === 0) {
-                updateState({ error: 'Voucher cannot be empty.' });
-                return;
+        // --- CONFIRMATION MODAL (Replacing window.confirm/alert) ---
+
+        window.showConfirmationModal = (action, type = null) => {
+            let message = '';
+            let handler = '';
+            let buttonText = 'Continue';
+            
+            if (action === 'scan') {
+                message = 'Mobile camera scanning is currently mocked. Enter the barcode manually into the input field above, and press Enter.';
+                handler = 'window.closeConfirmationModal()';
+                buttonText = 'Got It';
+            } else if (action === 'record') {
+                if (!state.currentVoucher.partyId) {
+                    message = 'Please select a Party before recording the voucher.';
+                    handler = 'window.closeConfirmationModal()';
+                    buttonText = 'OK';
+                } else if (state.currentVoucher.items.length === 0) {
+                    message = 'Voucher cannot be empty.';
+                    handler = 'window.closeConfirmationModal()';
+                    buttonText = 'OK';
+                } else {
+                    const partyName = state.parties.find(p => p.id === state.currentVoucher.partyId)?.name || 'Unknown Party';
+                    message = `Are you sure you want to record this ${type} voucher for Party: ${partyName} with a total of ${getCurrency(state.currentVoucher.totalAmount)}? This will update stock.`;
+                    handler = `window.recordVoucherAction('${type}')`;
+                    buttonText = `Yes, Record ${type}`;
+                }
             }
 
-            const partyName = state.parties.find(p => p.id === state.currentVoucher.partyId)?.name;
-            const confirmMessage = `Are you sure you want to record this ${type} voucher for Party: ${partyName} with a total of ${getCurrency(state.currentVoucher.totalAmount)}? This will update stock.`;
+            updateState({ 
+                modalType: 'CONFIRMATION', 
+                modalMessage: message, 
+                modalHandler: handler,
+                modalButtonText: buttonText,
+            });
+        };
 
-            // Use a simple modal for confirmation (cannot use window.confirm)
-            if (window.confirm(confirmMessage)) {
-                window.recordVoucher({ 
-                    ...state.currentVoucher, 
-                    type: type,
-                    executiveName: state.user.username,
-                    totalAmount: state.currentVoucher.totalAmount, // Ensure total is current
-                });
-            }
+        window.closeConfirmationModal = () => {
+            updateState({ modalType: null, modalMessage: null, modalHandler: null, modalButtonText: null });
+        };
+
+        window.recordVoucherAction = (type) => {
+            window.closeConfirmationModal();
+            window.recordVoucher({ 
+                ...state.currentVoucher, 
+                type: type,
+                executiveName: state.user.username,
+                totalAmount: state.currentVoucher.totalAmount,
+            });
+        };
+        
+        const renderConfirmationModal = () => {
+            if (state.modalType !== 'CONFIRMATION') return '';
+
+            return `
+                <div id="confirmationModal" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
+                    <div class="tally-panel w-full max-w-sm p-6 space-y-4 text-center">
+                        <p class="text-white text-lg">${state.modalMessage}</p>
+                        <div class="flex justify-center space-x-4 pt-4">
+                            ${state.modalButtonText !== 'OK' && state.modalButtonText !== 'Got It' ? `
+                                <button onclick="window.closeConfirmationModal()" class="btn-secondary tally-button">
+                                    No, Cancel
+                                </button>
+                            ` : ''}
+                            <button onclick="${state.modalHandler}" class="btn-primary tally-button">
+                                ${state.modalButtonText}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
         };
 
         // --- MAIN RENDER LOOP ---
@@ -936,20 +849,6 @@
         const render = () => {
             const appContainer = document.getElementById('app-container');
             if (!appContainer) return;
-
-            if (state.view === 'LOADING' && !state.isAuthReady) {
-                appContainer.innerHTML = `
-                    <div class="min-h-screen flex items-center justify-center text-xl text-white">
-                        Connecting to Cloud Server...
-                    </div>
-                `;
-                return;
-            }
-
-            if (state.view === 'LOGIN' || !state.isAuthenticated) {
-                appContainer.innerHTML = renderLogin();
-                return;
-            }
 
             // Main ERP Layout
             let content;
@@ -985,28 +884,28 @@
 
         // Expose functions globally for HTML event handlers
         window.updateState = updateState;
-        window.handleLogin = handleLogin;
+        window.addUpdateInventoryItem = addUpdateInventoryItem;
+        window.addUpdateParty = addUpdateParty;
         window.openInventoryModal = openInventoryModal;
         window.closeInventoryModal = closeInventoryModal;
         window.saveInventoryItem = saveInventoryItem;
-        window.addUpdateInventoryItem = addUpdateInventoryItem;
         window.openPartyModal = openPartyModal;
         window.closePartyModal = closePartyModal;
         window.saveParty = saveParty;
-        window.addUpdateParty = addUpdateParty;
+        window.updateCurrentVoucherParty = updateCurrentVoucherParty;
         window.handleBarcodeInput = handleBarcodeInput;
-        window.handleCameraScan = handleCameraScan;
         window.addItemToVoucher = addItemToVoucher;
         window.updateVoucherItemQuantity = updateVoucherItemQuantity;
         window.removeVoucherItem = removeVoucherItem;
-        window.confirmVoucherRecord = confirmVoucherRecord;
-        window.recordVoucher = recordVoucher;
+        window.showConfirmationModal = showConfirmationModal;
+        window.closeConfirmationModal = closeConfirmationModal;
+        window.recordVoucherAction = recordVoucherAction;
 
         // Initialize App on load
-        window.onload = initializeFirebase;
-
-        // Initial render
-        render();
+        window.onload = () => {
+            loadData();
+            render();
+        };
 
     </script>
 </head>
